@@ -1,10 +1,19 @@
 import WebSocket from 'ws';
 import { Config } from '../config';
-import { TextChannel } from 'discord.js';
+import {
+  ButtonInteraction,
+  ColorResolvable,
+  EmbedBuilder,
+  TextChannel,
+} from 'discord.js';
 import { CampaignTermsService } from './campaign-terms-service';
+import { CharacterModeService } from './character-mode-service';
 
 interface PendingTranscript {
+  userId: string;
   username: string;
+  label: string;
+  color: string;
   text: string;
   timestamp: number;
 }
@@ -27,6 +36,9 @@ export class LiveTranscriptionService {
   private userNames: Map<string, string> = new Map();
 
   private textChannel: TextChannel;
+  private voiceChannelId: string;
+  private sessionToken: string;
+
   private buffer: PendingTranscript[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -37,11 +49,23 @@ export class LiveTranscriptionService {
   // Keep Discord messages below the API limit.
   private static MAX_MESSAGE_LENGTH = 1900;
 
+  // Discord embed description maximum is 4096.
+  private static MAX_EMBED_DESCRIPTION_LENGTH = 3900;
+
+  // Keep total embed content safely below Discord's message limit.
+  private static MAX_EMBED_MESSAGE_LENGTH = 5800;
+
   // Deepgram recommends KeepAlive every 3-5 seconds during silence.
   private static KEEPALIVE_INTERVAL_MS = 4000;
 
-  constructor(textChannel: TextChannel) {
+  constructor(
+    textChannel: TextChannel,
+    voiceChannelId: string,
+    sessionToken: string,
+  ) {
     this.textChannel = textChannel;
+    this.voiceChannelId = voiceChannelId;
+    this.sessionToken = sessionToken;
   }
 
   /**
@@ -213,6 +237,7 @@ export class LiveTranscriptionService {
         try {
           response.on('data', (...args: unknown[]) => {
             const chunk = args[0];
+
             if (Buffer.isBuffer(chunk)) {
               body += chunk.toString('utf8');
             } else if (typeof chunk === 'string') {
@@ -362,8 +387,19 @@ export class LiveTranscriptionService {
             msg.channel.alternatives[0].transcript?.trim();
 
           if (transcript) {
+            const presentation =
+              CharacterModeService.getPresentation(
+                this.textChannel.guild.id,
+                this.voiceChannelId,
+                userId,
+                username,
+              );
+
             this.buffer.push({
+              userId,
               username,
+              label: presentation.label,
+              color: presentation.color,
               text: transcript,
               timestamp: Date.now(),
             });
@@ -497,6 +533,17 @@ export class LiveTranscriptionService {
 
     const items = this.buffer.splice(0);
 
+    if (!CharacterModeService.isEnabled()) {
+      await this.flushPlainText(items);
+      return;
+    }
+
+    await this.flushEmbeds(items);
+  }
+
+  private async flushPlainText(
+    items: PendingTranscript[],
+  ): Promise<void> {
     // Group consecutive results by speaker.
     const lines: string[] = [];
     let lastUser = '';
@@ -532,6 +579,127 @@ export class LiveTranscriptionService {
     }
   }
 
+  private splitTranscriptText(text: string): string[] {
+    if (
+      text.length <=
+      LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH
+    ) {
+      return [text];
+    }
+
+    const chunks: string[] = [];
+
+    let remaining = text;
+
+    while (
+      remaining.length >
+      LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH
+    ) {
+      let splitAt =
+        remaining.lastIndexOf(
+          ' ',
+          LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH,
+        );
+
+      if (splitAt <= 0) {
+        splitAt =
+          LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH;
+      }
+
+      chunks.push(remaining.slice(0, splitAt).trim());
+      remaining = remaining.slice(splitAt).trim();
+    }
+
+    if (remaining) {
+      chunks.push(remaining);
+    }
+
+    return chunks;
+  }
+
+  private async flushEmbeds(
+    items: PendingTranscript[],
+  ): Promise<void> {
+    interface EmbedGroup {
+      label: string;
+      color: string;
+      text: string;
+    }
+
+    const groups: EmbedGroup[] = [];
+
+    for (const item of items) {
+      const last = groups[groups.length - 1];
+
+      if (
+        last &&
+        last.label === item.label &&
+        last.color === item.color
+      ) {
+        last.text += ` ${item.text}`;
+      } else {
+        groups.push({
+          label: item.label,
+          color: item.color,
+          text: item.text,
+        });
+      }
+    }
+
+    let embeds: EmbedBuilder[] = [];
+    let totalLength = 0;
+
+    const sendEmbeds = async (): Promise<void> => {
+      if (embeds.length === 0) {
+        return;
+      }
+
+      try {
+        await this.textChannel.send({
+          embeds,
+        });
+      } catch (err) {
+        console.error(
+          '[LiveTranscription] Failed to post embeds to channel:',
+          err,
+        );
+      }
+
+      embeds = [];
+      totalLength = 0;
+    };
+
+    for (const group of groups) {
+      const chunks = this.splitTranscriptText(group.text);
+
+      for (const chunk of chunks) {
+        const estimatedLength =
+          group.label.length +
+          chunk.length;
+
+        if (
+          embeds.length >= 10 ||
+          totalLength + estimatedLength >
+            LiveTranscriptionService.MAX_EMBED_MESSAGE_LENGTH
+        ) {
+          await sendEmbeds();
+        }
+
+        const embed = new EmbedBuilder()
+          .setAuthor({ name: group.label })
+          .setDescription(chunk)
+          .setColor(
+            group.color as ColorResolvable,
+          );
+
+        embeds.push(embed);
+        totalLength += estimatedLength;
+      }
+    }
+
+    await sendEmbeds();
+  }
+
   private async postToChannel(
     content: string,
   ): Promise<void> {
@@ -543,6 +711,142 @@ export class LiveTranscriptionService {
         err,
       );
     }
+  }
+
+  /**
+   * Post the DM/character mode control panel to the transcript channel.
+   */
+  async postCharacterModePanel(): Promise<void> {
+    if (!CharacterModeService.isEnabled()) {
+      return;
+    }
+
+    const dmUserIds = CharacterModeService.getDmUserIds();
+
+    if (dmUserIds.length === 0) {
+      return;
+    }
+
+    const userId = dmUserIds[0];
+
+    try {
+      await this.textChannel.send({
+        content: CharacterModeService.buildPanelContent(
+          this.textChannel.guild.id,
+          this.voiceChannelId,
+          userId,
+        ),
+        components:
+          CharacterModeService.buildPanelComponents(
+            this.voiceChannelId,
+            this.sessionToken,
+          ),
+      });
+    } catch (err) {
+      console.error(
+        '[LiveTranscription] Failed to post character mode panel:',
+        err,
+      );
+    }
+  }
+
+  /**
+   * Handle a DM/character mode button interaction.
+   *
+   * Only configured DM users can change the mode.
+   * Buttons from old recording sessions are rejected.
+   */
+  async handleCharacterModeButton(
+    interaction: ButtonInteraction,
+  ): Promise<void> {
+    if (!CharacterModeService.isDmUser(interaction.user.id)) {
+      await interaction.reply({
+        content:
+          'Apenas a DM configurada pode alterar o modo de fala.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const buttonVoiceChannelId =
+      CharacterModeService.voiceChannelIdFromButton(
+        interaction.customId,
+      );
+
+    const buttonSessionToken =
+      CharacterModeService.sessionTokenFromButton(
+        interaction.customId,
+      );
+
+    if (
+      buttonVoiceChannelId !== this.voiceChannelId ||
+      buttonSessionToken !== this.sessionToken
+    ) {
+      await interaction.reply({
+        content:
+          'Este painel pertence a uma gravação anterior.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const parsed =
+      CharacterModeService.modeFromButton(
+        interaction.customId,
+      );
+
+    if (!parsed) {
+      await interaction.reply({
+        content: 'Modo de fala invalido.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (
+      parsed.mode === 'character' &&
+      !parsed.characterName
+    ) {
+      await interaction.reply({
+        content: 'Personagem invalido.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (
+      parsed.mode === 'character' &&
+      !CharacterModeService.getCharacter(
+        parsed.characterName!,
+      )
+    ) {
+      await interaction.reply({
+        content: 'Esse personagem nao esta configurado.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    CharacterModeService.setMode(
+      interaction.guildId ?? this.textChannel.guild.id,
+      this.voiceChannelId,
+      interaction.user.id,
+      parsed.mode,
+      parsed.characterName,
+    );
+
+    await interaction.update({
+      content: CharacterModeService.buildPanelContent(
+        interaction.guildId ?? this.textChannel.guild.id,
+        this.voiceChannelId,
+        interaction.user.id,
+      ),
+      components:
+        CharacterModeService.buildPanelComponents(
+          this.voiceChannelId,
+          this.sessionToken,
+        ),
+    });
   }
 
   /**
@@ -614,6 +918,11 @@ export class LiveTranscriptionService {
     }
 
     this.connections.clear();
+
+    CharacterModeService.clearSession(
+      this.textChannel.guild.id,
+      this.voiceChannelId,
+    );
 
     console.log('[LiveTranscription] All streams closed');
   }

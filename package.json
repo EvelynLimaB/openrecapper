@@ -13,8 +13,8 @@
     "start": "node dist/index.js",
     "dev": "npx tsx src/index.ts",
     "register": "npx tsx src/register-commands.ts",
-    "test": "npx tsx tests/test-mixdown.ts && npx tsx tests/test-recorder-pool.ts && npx tsx tests/test-channel-guard.ts"
-  },
+    "test": "npx tsx tests/test-mixdown.ts && npx tsx tests/test-recorder-pool.ts && npx tsx tests/test-channel-guard.ts && npx tsx tests/test-character-mode.ts"
+},
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1014.0",
     "@discordjs/opus": "^0.10.0",
