@@ -1,4 +1,4 @@
-import { VoiceWorker, StopResult } from '../workers/voice-worker';
+﻿import { VoiceWorker, StopResult } from '../workers/voice-worker';
 import { TranscriptionService } from './transcription-service';
 import { StorageService } from './storage-service';
 import { SummaryService } from './summary-service';
@@ -103,7 +103,7 @@ export class WorkerManager {
   /**
    * Synchronously reserve a channel for an incoming recording. Returns false
    * if the channel is already recording or mid-startup. Atomic by virtue of
-   * running to completion with no `await` in between — this is the
+   * running to completion with no `await` in between â€” this is the
    * authoritative one-bot-per-channel guard (the command-layer isRecording()
    * check is only a friendly fast-path).
    */
@@ -139,7 +139,7 @@ export class WorkerManager {
   }
 
   async startRecording(options: StartRecordingOptions): Promise<void> {
-    // Reserve the target CHANNEL synchronously — before any await can run — so
+    // Reserve the target CHANNEL synchronously â€” before any await can run â€” so
     // two near-simultaneous starts for the same channel cannot both proceed
     // and put two different recorder bots into one voice channel.
     if (!this.reserveChannel(options.channelId)) {
@@ -174,7 +174,7 @@ export class WorkerManager {
         if (guild) {
           const targetChannel = await client.channels.fetch(options.textChannelId) as TextChannel;
           if (targetChannel?.isTextBased?.()) {
-            liveTranscription = new LiveTranscriptionService(targetChannel as TextChannel);
+            liveTranscription = new LiveTranscriptionService(\n              targetChannel as TextChannel,\n              options.channelId,\n              path.basename(sessionDir),\n            );
             console.log(`[WorkerManager] Live transcription will post to #${targetChannel.name}`);
           }
         }
@@ -305,7 +305,7 @@ export class WorkerManager {
     if (files.length === 0) {
       console.log('[WorkerManager] No audio files to transcribe');
       if (textChannel?.isTextBased?.()) {
-        await textChannel.send(`⚠️ Recording in <#${session.channelId}> ended with no audio captured.`);
+        await textChannel.send(`âš ï¸ Recording in <#${session.channelId}> ended with no audio captured.`);
       }
       return;
     }
@@ -381,7 +381,7 @@ export class WorkerManager {
         const participants = Array.from(speakerNames.values());
         const generated = await SummaryService.summarize(rosterHeader + transcriptText, participants);
         if (generated) {
-          const summaryDoc = `# ${session.callName} — Session Notes\n\n` +
+          const summaryDoc = `# ${session.callName} â€” Session Notes\n\n` +
             `${rosterHeader}${generated.text}\n`;
           summaryText = summaryDoc;
           summaryTruncated = generated.truncated;
@@ -389,7 +389,7 @@ export class WorkerManager {
           console.log(`[WorkerManager] Summary saved to ${summaryPath}`);
         }
       } catch (err) {
-        relayWarning = '⚠️ AI summary failed; transcript and audio are still available.';
+        relayWarning = 'âš ï¸ AI summary failed; transcript and audio are still available.';
         console.error('[WorkerManager] Summary generation failed:', err);
       }
     } else {
@@ -433,11 +433,11 @@ export class WorkerManager {
         r2Prefix = uploadResult.prefix;
         console.log(`[WorkerManager] Uploaded to R2: ${r2Prefix}`);
       } catch (err) {
-        uploadWarning = `⚠️ Cloud upload failed; files remain on the server at \`${sessionDir}\`.`;
+        uploadWarning = `âš ï¸ Cloud upload failed; files remain on the server at \`${sessionDir}\`.`;
         console.error('[WorkerManager] R2 upload failed:', err);
       }
     } else {
-      uploadWarning = `⚠️ Cloud storage is not configured; files remain on the server at \`${sessionDir}\`.`;
+      uploadWarning = `âš ï¸ Cloud storage is not configured; files remain on the server at \`${sessionDir}\`.`;
       console.warn('[WorkerManager] R2 not configured, skipping cloud upload');
     }
 
@@ -465,7 +465,7 @@ export class WorkerManager {
         });
         console.log(`[WorkerManager] Emailed summary to ${Config.SUMMARY_EMAIL_TO}`);
       } catch (err) {
-        emailWarning = '⚠️ Email delivery failed; results are posted here only.';
+        emailWarning = 'âš ï¸ Email delivery failed; results are posted here only.';
         console.error('[WorkerManager] Failed to email summary:', err);
       }
     }
@@ -591,7 +591,7 @@ export class WorkerManager {
     ].filter((part) => part !== '');
     await RelayClient.email(
       Config.SUMMARY_EMAIL_TO,
-      `[${Config.BOT_NAME}] ${session.callName} — notes & transcript`,
+      `[${Config.BOT_NAME}] ${session.callName} â€” notes & transcript`,
       bodyParts.join('\n')
     );
   }
@@ -608,7 +608,7 @@ export class WorkerManager {
     const warnings = [artifacts.uploadWarning, artifacts.relayWarning, artifacts.emailWarning].filter(Boolean);
 
     if (artifacts.transcriptionFailed) {
-      warnings.unshift(`⚠️ Deepgram transcription failed after retry; audio is preserved at \`${artifacts.sessionDir}\`.`);
+      warnings.unshift(`âš ï¸ Deepgram transcription failed after retry; audio is preserved at \`${artifacts.sessionDir}\`.`);
     }
 
     // Small text artifacts ride with the main message; the (potentially large)
@@ -641,11 +641,11 @@ export class WorkerManager {
     if (artifacts.r2Prefix) {
       const publicBase = Config.R2_PUBLIC_URL;
       if (publicBase) {
-        r2Note = `\n\n📁 **Recordings:**\n` +
-          (artifacts.summaryText ? `📝 Summary: ${publicBase}/${artifacts.r2Prefix}/summary.md\n` : '') +
-          (artifacts.transcriptionFailed ? '' : `📄 Transcript: ${publicBase}/${artifacts.r2Prefix}/transcript.txt\n`) +
-          (artifacts.transcriptionFailed ? '' : `🎬 Subtitles: ${publicBase}/${artifacts.r2Prefix}/transcript.srt\n`) +
-          `🔊 Audio: ${publicBase}/${artifacts.r2Prefix}/recording.wav`;
+        r2Note = `\n\nðŸ“ **Recordings:**\n` +
+          (artifacts.summaryText ? `ðŸ“ Summary: ${publicBase}/${artifacts.r2Prefix}/summary.md\n` : '') +
+          (artifacts.transcriptionFailed ? '' : `ðŸ“„ Transcript: ${publicBase}/${artifacts.r2Prefix}/transcript.txt\n`) +
+          (artifacts.transcriptionFailed ? '' : `ðŸŽ¬ Subtitles: ${publicBase}/${artifacts.r2Prefix}/transcript.srt\n`) +
+          `ðŸ”Š Audio: ${publicBase}/${artifacts.r2Prefix}/recording.wav`;
       } else {
         r2Note = `\n**Archived:** \`${artifacts.r2Prefix}\``;
       }
@@ -653,7 +653,7 @@ export class WorkerManager {
 
     const statusTitle = artifacts.transcriptionFailed ? 'recording saved; transcription failed' : 'transcription complete';
     const warningNote = warnings.length ? `\n\n${warnings.join('\n')}` : '';
-    const content = `📝 **${session.callName}** — ${statusTitle} for <#${session.channelId}>\n\n` +
+    const content = `ðŸ“ **${session.callName}** â€” ${statusTitle} for <#${session.channelId}>\n\n` +
       `**Duration:** ${mins}m ${secs}s\n` +
       `**Speakers:** ${artifacts.speakerCount}\n` +
       `**Requested by:** <@${session.requesterId}>${r2Note}${warningNote}`;
@@ -685,7 +685,7 @@ export class WorkerManager {
     //    the summary above.
     if (wavAttachment) {
       try {
-        await target.send({ content: '🔊 Audio recording:', files: [wavAttachment] });
+        await target.send({ content: 'ðŸ”Š Audio recording:', files: [wavAttachment] });
       } catch (err) {
         console.error('[WorkerManager] Failed to post audio attachment (available via R2 link):', err);
       }
@@ -703,13 +703,13 @@ export class WorkerManager {
         }
       }
 
-      // 4) If the model hit the hard token cap, the summary above is cut off —
+      // 4) If the model hit the hard token cap, the summary above is cut off â€”
       //    tell readers where the full transcript is so they can summarize it
       //    with their own LLM.
       if (artifacts.summaryTruncated) {
         try {
           await target.send({
-            content: '⚠️ The AI summary above hit its length limit and is cut off at the end. ' +
+            content: 'âš ï¸ The AI summary above hit its length limit and is cut off at the end. ' +
               'For complete notes, download `transcript.txt` (attached above) and generate a summary with your own LLM.',
           });
         } catch (err) {
@@ -1062,7 +1062,7 @@ export class WorkerManager {
     // Check every 60 seconds
     const CHECK_INTERVAL_MS = 60_000;
 
-    console.log(`[SilenceMonitor] Monitoring channel ${session.channelId} — timeout: ${timeoutMinutes} min`);
+    console.log(`[SilenceMonitor] Monitoring channel ${session.channelId} â€” timeout: ${timeoutMinutes} min`);
 
     session.silenceCheckTimer = setInterval(async () => {
       const lastActivity = session.worker.getLastVoiceActivityAt();
@@ -1075,7 +1075,7 @@ export class WorkerManager {
       if (silentMs >= timeoutMs) {
         console.log(
           `[SilenceMonitor] No voice activity for ${Math.round(silentMs / 60000)} min ` +
-          `in channel ${session.channelId} — auto-stopping`
+          `in channel ${session.channelId} â€” auto-stopping`
         );
         await this.silenceAutoStop(session);
       }
@@ -1145,7 +1145,7 @@ export class WorkerManager {
       if (textChannel?.isTextBased?.()) {
         const timeoutMinutes = Config.SILENCE_TIMEOUT_MINUTES;
         await (textChannel as TextChannel).send(
-          `🔇 Recording ended — no voice activity detected for ${timeoutMinutes} minutes. ` +
+          `ðŸ”‡ Recording ended â€” no voice activity detected for ${timeoutMinutes} minutes. ` +
           `Leaving <#${channelId}>.`
         );
       }

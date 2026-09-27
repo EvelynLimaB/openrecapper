@@ -1,9 +1,9 @@
-import {
+﻿import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
-import { Config } from '../src/config';
+import { Config } from '../config';
 
 export type SpeakerMode = 'dm' | 'character';
 
@@ -28,9 +28,9 @@ interface SessionMode {
 const DM_COLOR = '#FFFFFF';
 const DEFAULT_COLOR = '#95A5A6';
 const BUTTON_PREFIX = 'ocr:character-mode:';
-const MAX_BUTTON_LABEL = 80;
-const MAX_COMPONENT_ROWS = 5;
 const MAX_BUTTONS_PER_ROW = 5;
+const MAX_COMPONENT_ROWS = 5;
+const MAX_CUSTOM_ID_LENGTH = 100;
 
 export class CharacterModeService {
   private static modes: Map<string, SessionMode> = new Map();
@@ -46,10 +46,6 @@ export class CharacterModeService {
         (character) => character.name.toLocaleLowerCase() === normalized,
       ) ?? null
     );
-  }
-
-  static getDmUserIds(): string[] {
-    return [...Config.CHARACTER_DM_USER_IDS];
   }
 
   static isDmUser(userId: string): boolean {
@@ -135,31 +131,51 @@ export class CharacterModeService {
 
   static voiceChannelIdFromButton(customId: string): string | null {
     if (!this.isModeButton(customId)) return null;
-    const remainder = customId.slice(BUTTON_PREFIX.length);
-    const separator = remainder.indexOf(':');
-    if (separator <= 0) return null;
-    return remainder.slice(0, separator);
+    const parts = customId.slice(BUTTON_PREFIX.length).split(':');
+    return parts[0] || null;
   }
 
-  static modeFromButton(customId: string): { mode: SpeakerMode; characterName: string | null } | null {
+  static sessionTokenFromButton(customId: string): string | null {
     if (!this.isModeButton(customId)) return null;
-    const remainder = customId.slice(BUTTON_PREFIX.length);
-    const separator = remainder.indexOf(':');
-    if (separator <= 0) return null;
+    const parts = customId.slice(BUTTON_PREFIX.length).split(':');
+    return parts[1] || null;
+  }
 
-    const action = remainder.slice(separator + 1);
+  static modeFromButton(customId: string): {
+    mode: SpeakerMode;
+    characterName: string | null;
+  } | null {
+    if (!this.isModeButton(customId)) return null;
+    const parts = customId.slice(BUTTON_PREFIX.length).split(':');
+    if (parts.length < 3) return null;
+
+    const action = parts.slice(2).join(':');
     if (action === 'dm') {
       return { mode: 'dm', characterName: null };
     }
+
     if (!action.startsWith('char:')) return null;
 
-    const encodedName = action.slice('char:'.length);
     try {
-      const characterName = decodeURIComponent(encodedName);
-      return { mode: 'character', characterName };
+      return {
+        mode: 'character',
+        characterName: decodeURIComponent(action.slice('char:'.length)),
+      };
     } catch {
       return null;
     }
+  }
+
+  static buildButtonCustomId(
+    voiceChannelId: string,
+    sessionToken: string,
+    action: string,
+  ): string {
+    const customId = `${BUTTON_PREFIX}${voiceChannelId}:${sessionToken}:${action}`;
+    if (customId.length > MAX_CUSTOM_ID_LENGTH) {
+      throw new Error(`Character mode custom ID is too long: ${customId.length}`);
+    }
+    return customId;
   }
 
   static buildPanelContent(
@@ -174,31 +190,35 @@ export class CharacterModeService {
         : 'DM / Narrador';
 
     return [
-      '🎭 **Modo de fala da DM**',
+      'ðŸŽ­ **Modo de fala da DM**',
       `Modo atual: **${active}**`,
-      'A mudança vale para as próximas falas reconhecidas.',
+      'A mudanÃ§a vale para as prÃ³ximas falas reconhecidas.',
     ].join('\n');
   }
 
   static buildPanelComponents(
     voiceChannelId: string,
+    sessionToken: string,
   ): ActionRowBuilder<ButtonBuilder>[] {
     const buttons: ButtonBuilder[] = [
       new ButtonBuilder()
-        .setCustomId(BUTTON_PREFIX + voiceChannelId + ':dm')
+        .setCustomId(this.buildButtonCustomId(voiceChannelId, sessionToken, 'dm'))
         .setLabel('DM / Narrador')
         .setStyle(ButtonStyle.Secondary),
     ];
 
     for (const character of this.getCharacters()) {
-      if (buttons.length >= MAX_COMPONENT_ROWS * MAX_BUTTONS_PER_ROW) break;
+      if (buttons.length >= MAX_BUTTONS_PER_ROW * MAX_COMPONENT_ROWS) break;
       const encoded = encodeURIComponent(character.name);
-      const customId = BUTTON_PREFIX + voiceChannelId + ':char:' + encoded;
-      if (customId.length > 100) continue;
+      const customId = this.buildButtonCustomId(
+        voiceChannelId,
+        sessionToken,
+        'char:' + encoded,
+      );
       buttons.push(
         new ButtonBuilder()
           .setCustomId(customId)
-          .setLabel(character.name.slice(0, MAX_BUTTON_LABEL))
+          .setLabel(character.name.slice(0, 80))
           .setStyle(ButtonStyle.Primary),
       );
     }
@@ -211,10 +231,15 @@ export class CharacterModeService {
         ),
       );
     }
+
     return rows.slice(0, MAX_COMPONENT_ROWS);
   }
 
   static getDmColor(): string {
     return DM_COLOR;
+  }
+
+  static getDefaultParticipantColor(): string {
+    return DEFAULT_COLOR;
   }
 }
