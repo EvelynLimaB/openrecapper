@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { Config } from '../config';
 import { TextChannel } from 'discord.js';
+import { CampaignTermsService } from './campaign-terms-service';
 
 interface PendingTranscript {
   username: string;
@@ -8,24 +9,36 @@ interface PendingTranscript {
   timestamp: number;
 }
 
+interface DeepgramConnectionError extends Error {
+  statusCode?: number;
+  responseBody?: string;
+}
+
 /**
  * Manages real-time transcription for a recording session.
- * Opens one Deepgram WebSocket per speaker, buffers results,
- * and posts batched transcripts to a Discord text channel.
+ *
+ * Opens one Deepgram WebSocket per speaker, sends raw PCM audio,
+ * buffers finalized transcript results, and posts them to Discord.
  */
 export class LiveTranscriptionService {
-  private connections: Map<string, WebSocket> = new Map(); // userId -> WS
-  private keepAliveTimers: Map<string, NodeJS.Timeout> = new Map(); // userId -> keepalive interval
-  private userNames: Map<string, string> = new Map(); // userId -> display name
+  private connections: Map<string, WebSocket> = new Map();
+  private keepAliveTimers: Map<string, NodeJS.Timeout> = new Map();
+  private lastAudioAt: Map<string, number> = new Map();
+  private userNames: Map<string, string> = new Map();
+
   private textChannel: TextChannel;
   private buffer: PendingTranscript[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private closed = false;
 
-  // Buffer transcripts for this many ms before posting
+  // Buffer transcripts for this many ms before posting.
   private static FLUSH_INTERVAL_MS = 3000;
-  // Max characters per Discord message
+
+  // Keep Discord messages below the API limit.
   private static MAX_MESSAGE_LENGTH = 1900;
+
+  // Deepgram recommends KeepAlive every 3-5 seconds during silence.
+  private static KEEPALIVE_INTERVAL_MS = 4000;
 
   constructor(textChannel: TextChannel) {
     this.textChannel = textChannel;
@@ -35,14 +48,19 @@ export class LiveTranscriptionService {
    * Resolve a Discord user ID to a display name.
    */
   async resolveUsername(userId: string): Promise<string> {
-    if (this.userNames.has(userId)) return this.userNames.get(userId)!;
+    if (this.userNames.has(userId)) {
+      return this.userNames.get(userId)!;
+    }
 
     try {
       const { getClient } = require('../client');
-      const client = getClient();
+      getClient();
+
       const guild = this.textChannel.guild;
       const member = await guild.members.fetch(userId);
+
       const name = member.displayName || member.user.username;
+
       this.userNames.set(userId, name);
       return name;
     } catch {
@@ -53,36 +71,42 @@ export class LiveTranscriptionService {
   }
 
   /**
-   * Open a Deepgram streaming WebSocket for a user and return
-   * a writable callback to send PCM audio data.
+   * Build the Deepgram streaming query parameters.
    */
-  async openStreamForUser(userId: string): Promise<(pcmChunk: Buffer) => void> {
-    // If we already have an open connection for this user (e.g. opus stream
-    // auto-closed and re-subscribed), reuse it
-    const existing = this.connections.get(userId);
-    if (existing && existing.readyState === WebSocket.OPEN) {
-      console.log(`[LiveTranscription] Reusing existing Deepgram stream for user ${userId}`);
-      this.startKeepAliveTimer(userId, existing);
-      return (pcmChunk: Buffer) => {
-        if (existing.readyState === WebSocket.OPEN) {
-          existing.send(pcmChunk);
-          this.resetKeepAliveTimer(userId, existing);
-        }
-      };
-    }
-
-    const username = await this.resolveUsername(userId);
-
+  private buildDeepgramParams(
+    includeKeyterms: boolean,
+  ): URLSearchParams {
     const params = new URLSearchParams({
       model: 'nova-3',
+      language: 'multi',
       encoding: 'linear16',
       sample_rate: '48000',
       channels: '2',
       punctuate: 'true',
       smart_format: 'true',
       interim_results: 'false',
+      endpointing: '100',
     });
 
+    if (includeKeyterms) {
+      const campaignTerms = CampaignTermsService.load();
+      CampaignTermsService.applyToParams(params, campaignTerms);
+    }
+
+    return params;
+  }
+
+  /**
+   * Open the Deepgram WebSocket and return it only after
+   * a successful HTTP 101 WebSocket handshake.
+   *
+   * HTTP handshake failures are surfaced immediately, including
+   * the actual status code instead of becoming a generic timeout.
+   */
+  private connectToDeepgram(
+    params: URLSearchParams,
+    username: string,
+  ): Promise<WebSocket> {
     const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
     const ws = new WebSocket(url, {
@@ -92,163 +116,461 @@ export class LiveTranscriptionService {
     });
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+
       const timeout = setTimeout(() => {
-        reject(new Error(`[LiveTranscription] Deepgram WS timeout for ${username}`));
+        const error = new Error(
+          `[LiveTranscription] Deepgram WS timeout for ${username}`,
+        ) as DeepgramConnectionError;
+
+        fail(error);
       }, 10000);
 
-      ws.on('open', () => {
+      const cleanup = () => {
         clearTimeout(timeout);
-        console.log(`[LiveTranscription] Deepgram stream opened for ${username}`);
-        this.connections.set(userId, ws);
-        this.startFlushTimer();
+        ws.off('open', onOpen);
+        ws.off('error', onErrorBeforeOpen);
+        ws.off('close', onCloseBeforeOpen);
+        ws.off('unexpected-response', onUnexpectedResponse);
+      };
 
-        // Start a keepalive timer — if no audio arrives for 8s, send
-        // Deepgram a KeepAlive so it doesn't close the WS (its timeout is ~12s).
-        this.startKeepAliveTimer(userId, ws);
-
-        resolve((pcmChunk: Buffer) => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(pcmChunk);
-            // Reset the keepalive timer on every audio send
-            this.resetKeepAliveTimer(userId, ws);
-          }
-        });
-      });
-
-      ws.on('message', (data: WebSocket.Data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === 'Results' && msg.is_final && msg.channel?.alternatives?.[0]) {
-            const transcript = msg.channel.alternatives[0].transcript?.trim();
-            if (transcript) {
-              this.buffer.push({
-                username,
-                text: transcript,
-                timestamp: Date.now(),
-              });
-            }
-          }
-        } catch (err) {
-          console.error('[LiveTranscription] Error parsing Deepgram message:', err);
+      const fail = (error: DeepgramConnectionError) => {
+        if (settled) {
+          return;
         }
-      });
 
-      ws.on('error', (err) => {
-        console.error(`[LiveTranscription] Deepgram WS error for ${username}:`, err.message);
-      });
+        settled = true;
+        cleanup();
 
-      ws.on('close', (code, reason) => {
-        console.log(`[LiveTranscription] Deepgram stream closed for ${username}: ${code} ${reason}`);
-        this.connections.delete(userId);
-        this.clearKeepAliveTimer(userId);
-      });
+        try {
+          if (
+            ws.readyState === WebSocket.OPEN ||
+            ws.readyState === WebSocket.CONNECTING
+          ) {
+            ws.close();
+          }
+        } catch {}
+
+        reject(error);
+      };
+
+      const onOpen = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        cleanup();
+        resolve(ws);
+      };
+
+      const onErrorBeforeOpen = (err: Error) => {
+        const error = new Error(
+          `[LiveTranscription] Deepgram WS error for ${username}: ${err.message}`,
+        ) as DeepgramConnectionError;
+
+        fail(error);
+      };
+
+      const onCloseBeforeOpen = (
+        code: number,
+        reason: Buffer,
+      ) => {
+        const reasonText = reason?.toString() || '';
+
+        const error = new Error(
+          `[LiveTranscription] Deepgram WS closed before opening for ${username}: ${code}${reasonText ? ` ${reasonText}` : ''}`,
+        ) as DeepgramConnectionError;
+
+        fail(error);
+      };
+
+      const onUnexpectedResponse = (
+        _request: unknown,
+        response: {
+          statusCode?: number;
+          statusMessage?: string;
+          on: (
+            event: string,
+            listener: (...args: unknown[]) => void,
+          ) => void;
+          resume?: () => void;
+        },
+      ) => {
+        const statusCode = response.statusCode ?? 0;
+        const statusMessage = response.statusMessage
+          ? ` ${response.statusMessage}`
+          : '';
+
+        const error = new Error(
+          `[LiveTranscription] Deepgram HTTP handshake failed for ${username}: ${statusCode}${statusMessage}`,
+        ) as DeepgramConnectionError;
+
+        error.statusCode = statusCode;
+
+        let body = '';
+
+        try {
+          response.on('data', (...args: unknown[]) => {
+            const chunk = args[0];
+            if (Buffer.isBuffer(chunk)) {
+              body += chunk.toString('utf8');
+            } else if (typeof chunk === 'string') {
+              body += chunk;
+            }
+          });
+
+          response.on('end', () => {
+            if (body.trim()) {
+              error.responseBody = body.trim();
+
+              console.error(
+                `[LiveTranscription] Deepgram handshake response for ${username}: ${body.trim()}`,
+              );
+            }
+
+            fail(error);
+          });
+
+          response.on('error', (...args: unknown[]) => {
+            const responseError = args[0];
+
+            if (responseError instanceof Error) {
+              error.responseBody = responseError.message;
+            }
+
+            fail(error);
+          });
+        } catch {
+          fail(error);
+        }
+
+        try {
+          response.resume?.();
+        } catch {}
+      };
+
+      ws.once('open', onOpen);
+      ws.once('error', onErrorBeforeOpen);
+      ws.once('close', onCloseBeforeOpen);
+      ws.once('unexpected-response', onUnexpectedResponse);
     });
   }
 
-  // --- Deepgram KeepAlive management ---
-  // Deepgram closes the WS if it receives no audio data within ~12s.
-  // We send a KeepAlive JSON message every 8s of silence to prevent that.
+  /**
+   * Open a Deepgram streaming WebSocket for a user and return
+   * a writable callback to send PCM audio data.
+   */
+  async openStreamForUser(
+    userId: string,
+  ): Promise<(pcmChunk: Buffer) => void> {
+    // Reuse an already-open stream for this user.
+    const existing = this.connections.get(userId);
 
-  private static KEEPALIVE_INTERVAL_MS = 8000;
+    if (existing && existing.readyState === WebSocket.OPEN) {
+      console.log(
+        `[LiveTranscription] Reusing existing Deepgram stream for user ${userId}`,
+      );
 
-  private startKeepAliveTimer(userId: string, ws: WebSocket): void {
-    this.clearKeepAliveTimer(userId);
-    const timer = setInterval(() => {
+      this.lastAudioAt.set(userId, Date.now());
+      this.startKeepAliveTimer(userId, existing);
+
+      return (pcmChunk: Buffer) => {
+        if (this.closed) {
+          return;
+        }
+
+        if (existing.readyState === WebSocket.OPEN) {
+          try {
+            existing.send(pcmChunk);
+            this.lastAudioAt.set(userId, Date.now());
+          } catch (err) {
+            console.error(
+              `[LiveTranscription] Failed to send PCM for user ${userId}:`,
+              err,
+            );
+          }
+        }
+      };
+    }
+
+    const username = await this.resolveUsername(userId);
+
+    let ws: WebSocket;
+
+    const paramsWithKeyterms = this.buildDeepgramParams(true);
+
+    try {
+      ws = await this.connectToDeepgram(
+        paramsWithKeyterms,
+        username,
+      );
+    } catch (err) {
+      const error = err as DeepgramConnectionError;
+
+      /*
+       * The campaign keyterm estimator used by this project is
+       * conservative, but Deepgram validates the actual token count
+       * server-side. If the request is rejected with HTTP 400 while
+       * keyterms are enabled, retry once without keyterms.
+       */
+      if (error.statusCode === 400) {
+        console.warn(
+          `[LiveTranscription] Deepgram rejected the keyterm configuration for ${username}; retrying without keyterms.`,
+        );
+
+        if (error.responseBody) {
+          console.warn(
+            `[LiveTranscription] Deepgram response: ${error.responseBody}`,
+          );
+        }
+
+        const fallbackParams = this.buildDeepgramParams(false);
+
+        ws = await this.connectToDeepgram(
+          fallbackParams,
+          `${username} (without keyterms)`,
+        );
+
+        console.log(
+          `[LiveTranscription] Deepgram stream opened for ${username} without keyterms`,
+        );
+      } else {
+        throw error;
+      }
+    }
+
+    console.log(
+      `[LiveTranscription] Deepgram stream opened for ${username}`,
+    );
+
+    this.connections.set(userId, ws);
+    this.lastAudioAt.set(userId, Date.now());
+    this.startFlushTimer();
+    this.startKeepAliveTimer(userId, ws);
+
+    ws.on('message', (data: WebSocket.Data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+
+        if (
+          msg.type === 'Results' &&
+          msg.is_final &&
+          msg.channel?.alternatives?.[0]
+        ) {
+          const transcript =
+            msg.channel.alternatives[0].transcript?.trim();
+
+          if (transcript) {
+            this.buffer.push({
+              username,
+              text: transcript,
+              timestamp: Date.now(),
+            });
+          }
+        }
+      } catch (err) {
+        console.error(
+          '[LiveTranscription] Error parsing Deepgram message:',
+          err,
+        );
+      }
+    });
+
+    ws.on('error', (err) => {
+      console.error(
+        `[LiveTranscription] Deepgram WS error for ${username}:`,
+        err.message,
+      );
+    });
+
+    ws.on('close', (code, reason) => {
+      const reasonText = reason?.toString() || '';
+
+      console.log(
+        `[LiveTranscription] Deepgram stream closed for ${username}: ${code}${reasonText ? ` ${reasonText}` : ''}`,
+      );
+
+      const current = this.connections.get(userId);
+
+      if (current === ws) {
+        this.connections.delete(userId);
+      }
+
+      this.clearKeepAliveTimer(userId);
+      this.lastAudioAt.delete(userId);
+    });
+
+    return (pcmChunk: Buffer) => {
+      if (this.closed) {
+        return;
+      }
+
       if (ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(JSON.stringify({ type: 'KeepAlive' }));
-        } catch {}
-      } else {
+          ws.send(pcmChunk);
+
+          // Track when audio was last sent. Do NOT recreate the
+          // KeepAlive timer for every PCM packet.
+          this.lastAudioAt.set(userId, Date.now());
+        } catch (err) {
+          console.error(
+            `[LiveTranscription] Failed to send PCM for ${username}:`,
+            err,
+          );
+        }
+      }
+    };
+  }
+
+  // --- Deepgram KeepAlive management ---
+
+  /**
+   * Keep exactly one timer per user.
+   *
+   * KeepAlive is only sent when the user has been silent long enough.
+   * Continuous PCM audio does not need extra KeepAlive messages.
+   */
+  private startKeepAliveTimer(
+    userId: string,
+    ws: WebSocket,
+  ): void {
+    this.clearKeepAliveTimer(userId);
+
+    const timer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        this.clearKeepAliveTimer(userId);
+        return;
+      }
+
+      const lastAudio = this.lastAudioAt.get(userId) ?? 0;
+      const silenceMs = Date.now() - lastAudio;
+
+      if (silenceMs < LiveTranscriptionService.KEEPALIVE_INTERVAL_MS) {
+        return;
+      }
+
+      try {
+        ws.send(JSON.stringify({ type: 'KeepAlive' }));
+      } catch (err) {
+        console.error(
+          `[LiveTranscription] Failed to send KeepAlive for user ${userId}:`,
+          err,
+        );
         this.clearKeepAliveTimer(userId);
       }
     }, LiveTranscriptionService.KEEPALIVE_INTERVAL_MS);
-    this.keepAliveTimers.set(userId, timer);
-  }
 
-  private resetKeepAliveTimer(userId: string, ws: WebSocket): void {
-    // Restart the timer — we just sent audio so the next keepalive
-    // should be KEEPALIVE_INTERVAL_MS from now, not from the last reset.
-    this.startKeepAliveTimer(userId, ws);
+    this.keepAliveTimers.set(userId, timer);
   }
 
   private clearKeepAliveTimer(userId: string): void {
     const timer = this.keepAliveTimers.get(userId);
+
     if (timer) {
       clearInterval(timer);
       this.keepAliveTimers.delete(userId);
     }
   }
 
+  // --- Discord transcript buffering ---
+
   private startFlushTimer(): void {
-    if (this.flushTimer) return;
+    if (this.flushTimer) {
+      return;
+    }
+
     this.flushTimer = setInterval(() => {
       this.flush().catch((err) => {
-        console.error('[LiveTranscription] Flush error:', err);
+        console.error(
+          '[LiveTranscription] Flush error:',
+          err,
+        );
       });
     }, LiveTranscriptionService.FLUSH_INTERVAL_MS);
   }
 
   private async flush(): Promise<void> {
-    if (this.buffer.length === 0) return;
+    if (this.buffer.length === 0) {
+      return;
+    }
 
     const items = this.buffer.splice(0);
 
-    // Group consecutive lines by same speaker
+    // Group consecutive results by speaker.
     const lines: string[] = [];
     let lastUser = '';
+
     for (const item of items) {
       if (item.username !== lastUser) {
         lines.push(`**${item.username}:** ${item.text}`);
         lastUser = item.username;
       } else {
-        // Append to last line
         lines[lines.length - 1] += ` ${item.text}`;
       }
     }
 
-    // Split into Discord-safe messages
+    // Split into Discord-safe messages.
     let message = '';
+
     for (const line of lines) {
-      if (message.length + line.length + 1 > LiveTranscriptionService.MAX_MESSAGE_LENGTH) {
+      if (
+        message.length + line.length + 1 >
+        LiveTranscriptionService.MAX_MESSAGE_LENGTH
+      ) {
         if (message) {
           await this.postToChannel(message);
           message = '';
         }
       }
+
       message += (message ? '\n' : '') + line;
     }
+
     if (message) {
       await this.postToChannel(message);
     }
   }
 
-  private async postToChannel(content: string): Promise<void> {
+  private async postToChannel(
+    content: string,
+  ): Promise<void> {
     try {
       await this.textChannel.send(content);
     } catch (err) {
-      console.error('[LiveTranscription] Failed to post to channel:', err);
+      console.error(
+        '[LiveTranscription] Failed to post to channel:',
+        err,
+      );
     }
   }
 
   /**
-   * Close a single user's Deepgram WebSocket (e.g. when their opus stream ends).
+   * Close a single user's Deepgram WebSocket.
    */
   closeStreamForUser(userId: string): void {
     this.clearKeepAliveTimer(userId);
+    this.lastAudioAt.delete(userId);
+
     const ws = this.connections.get(userId);
+
     if (ws && ws.readyState === WebSocket.OPEN) {
       try {
         ws.send(JSON.stringify({ type: 'CloseStream' }));
       } catch {}
     }
+
     this.connections.delete(userId);
   }
 
   /**
-   * Close all Deepgram WebSockets and flush remaining buffer.
+   * Close all Deepgram WebSockets and flush remaining results.
    */
   async close(): Promise<void> {
-    if (this.closed) return;
+    if (this.closed) {
+      return;
+    }
+
     this.closed = true;
 
     if (this.flushTimer) {
@@ -256,33 +578,41 @@ export class LiveTranscriptionService {
       this.flushTimer = null;
     }
 
-    // Clear all keepalive timers
-    for (const [userId] of this.keepAliveTimers) {
+    // Stop all KeepAlive timers.
+    for (const userId of this.keepAliveTimers.keys()) {
       this.clearKeepAliveTimer(userId);
     }
 
-    // Send close signal to each Deepgram WS
+    // Ask Deepgram to finalize and close every stream.
     for (const [userId, ws] of this.connections) {
       try {
         if (ws.readyState === WebSocket.OPEN) {
-          // Deepgram expects a JSON close message
           ws.send(JSON.stringify({ type: 'CloseStream' }));
         }
       } catch {}
     }
 
-    // Wait a moment for final results to come in
+    // Give Deepgram time to send final Results before the local
+    // connection is forcefully closed.
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
-    // Flush remaining buffer
+    // Post any results that arrived during shutdown.
     await this.flush();
 
-    // Force close any remaining connections
+    // Force-close anything still open.
     for (const [userId, ws] of this.connections) {
       try {
-        ws.close();
+        if (
+          ws.readyState === WebSocket.OPEN ||
+          ws.readyState === WebSocket.CONNECTING
+        ) {
+          ws.close();
+        }
       } catch {}
+
+      this.lastAudioAt.delete(userId);
     }
+
     this.connections.clear();
 
     console.log('[LiveTranscription] All streams closed');

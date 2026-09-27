@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { CampaignTermsService } from './campaign-terms-service';
 
 interface Segment {
   speaker: string;
@@ -98,14 +99,16 @@ export class TranscriptionService {
     console.log(`[Transcription] Sending ${path.basename(wavPath)} to Deepgram Nova-3 (${sizeMB}MB)`);
 
     const params = new URLSearchParams({
-      model: 'nova-3',
-      smart_format: 'true',
-      diarize: 'true',
-      utterances: 'true',
-      punctuate: 'true',
-      paragraphs: 'true',
-    });
-
+  model: 'nova-3',
+  language: 'multi',
+  smart_format: 'true',
+  diarize: 'true',
+  utterances: 'true',
+  punctuate: 'true',
+  paragraphs: 'true',
+});
+	const campaignTerms = CampaignTermsService.load();
+CampaignTermsService.applyToParams(params, campaignTerms);
     const result = await this.postToDeepgram(wavPath, stats.size, params, 'audio/wav');
     const segments = this.extractSegments(result, 'Speaker 0', 0, true);
 
@@ -129,17 +132,20 @@ export class TranscriptionService {
     );
 
     const params = new URLSearchParams({
-      model: 'nova-3',
-      encoding: 'linear16',
-      sample_rate: '48000',
-      channels: '2',
-      smart_format: 'true',
-      utterances: 'true',
-      punctuate: 'true',
-      paragraphs: 'true',
-    });
+  model: 'nova-3',
+  language: 'multi',
+  encoding: 'linear16',
+  sample_rate: '48000',
+  channels: '2',
+  smart_format: 'true',
+  utterances: 'true',
+  punctuate: 'true',
+  paragraphs: 'true',
+});
 
-    const result = await this.postToDeepgram(track.filePath, stats.size, params, 'audio/raw');
+const campaignTerms = CampaignTermsService.load();
+CampaignTermsService.applyToParams(params, campaignTerms);    
+const result = await this.postToDeepgram(track.filePath, stats.size, params, 'audio/raw');
     return this.extractSegments(result, track.speakerName, offsetSeconds, false);
   }
 

@@ -73,8 +73,8 @@ export class VoiceWorker {
       guildId: this.options.guildId,
       // @discordjs/voice keys connections by (group, guildId) and group
       // defaults to 'default'. With several clients in one process recording
-      // the same guild, a shared group would make the second join clobber the
-      // first connection — so each client gets its own group.
+      // the same guild, a shared group would make the second join clobber
+      // the first connection — so each client gets its own group.
       group: client.user!.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: false,
@@ -85,15 +85,21 @@ export class VoiceWorker {
     // Log connection state changes (only significant ones)
     this.connection.on('stateChange', (oldState, newState) => {
       if (oldState.status !== newState.status) {
-        console.log(`[VoiceWorker] Connection: ${oldState.status} -> ${newState.status}`);
+        console.log(
+          `[VoiceWorker] Connection: ${oldState.status} -> ${newState.status}`
+        );
       }
+
       // Capture networking errors
       if ('networking' in newState) {
         const networking = (newState as any).networking;
         if (networking) {
           networking.on?.('close', (code: any) => {
-            console.log(`[VoiceWorker] Networking WS close code: ${code}`);
+            console.log(
+              `[VoiceWorker] Networking WS close code: ${code}`
+            );
           });
+
           networking.on?.('error', (err: any) => {
             console.error(`[VoiceWorker] Networking error:`, err);
           });
@@ -109,25 +115,50 @@ export class VoiceWorker {
     try {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
     } catch (err) {
-      console.error(`[VoiceWorker] Failed to reach Ready state. Current status: ${this.connection.state.status}`);
+      console.error(
+        `[VoiceWorker] Failed to reach Ready state. Current status: ${this.connection.state.status}`
+      );
+
       // Log full state for debugging
-      console.error(`[VoiceWorker] Full state:`, JSON.stringify(this.connection.state, (key, val) => {
-        if (key === 'ws' || key === 'networking') return '[object]';
-        return val;
-      }, 2));
+      console.error(
+        `[VoiceWorker] Full state:`,
+        JSON.stringify(
+          this.connection.state,
+          (key, val) => {
+            if (key === 'ws' || key === 'networking') return '[object]';
+            return val;
+          },
+          2
+        )
+      );
+
       this.connection.destroy();
       throw err;
     }
-    console.log(`[VoiceWorker] Connected to channel ${this.options.channelId}`);
+
+    console.log(
+      `[VoiceWorker] Connected to channel ${this.options.channelId}`
+    );
 
     // Listen for audio
     const receiver = this.connection.receiver;
 
-    console.log(`[VoiceWorker] Receiver ready, listening for speaking events...`);
+    console.log(
+      `[VoiceWorker] Receiver ready, listening for speaking events...`
+    );
 
     receiver.speaking.on('start', (userId: string) => {
-      // Mark voice activity on every speaking-start event (even if already recording)
+      // Never treat Discord bots as voice participants.
+      // This must happen before updating lastVoiceActivityAt,
+      // otherwise music/activity from a bot could prevent silence timeout.
+      if (this.isBotUser(userId)) {
+        console.log(`[VoiceWorker] Ignoring bot audio: ${userId}`);
+        return;
+      }
+
+      // Mark voice activity only for real users.
       this.lastVoiceActivityAt = Date.now();
+
       if (this.userStreams.has(userId)) return; // Already recording this user
       this.startUserStream(userId, receiver);
     });
@@ -144,6 +175,7 @@ export class VoiceWorker {
     // for each user is opened lazily on their first decoded PCM chunk (see
     // startUserStream), so silent listeners do not each hold open a Deepgram
     // websocket before they actually speak.
+    //
     // Enumerate channel members via the PRIMARY client (its member cache is
     // warm from long-running gateway traffic; a freshly-logged-in recorder's
     // is not). The receiver we subscribe on still belongs to this worker's
@@ -152,25 +184,59 @@ export class VoiceWorker {
     this.subscribeExistingMembers(receiver, getClient());
   }
 
+  private isBotUser(userId: string): boolean {
+    const { getClient } = require('../client');
+    const client = getClient();
+
+    const guild = client.guilds.cache.get(this.options.guildId);
+    const member = guild?.members.cache.get(userId);
+
+    if (member?.user?.bot === true) {
+      return true;
+    }
+
+    // Fallback to the global user cache.
+    const user = client.users.cache.get(userId);
+    return user?.bot === true;
+  }
+
   private subscribeExistingMembers(receiver: any, client: any): void {
     try {
       const guild = client.guilds.cache.get(this.options.guildId);
       const channel = guild?.channels?.cache?.get(this.options.channelId);
       const members = channel?.members; // Collection<userId, GuildMember> for voice channels
+
       if (!members) return;
+
       for (const [userId, member] of members) {
         if (member.user?.bot) continue; // skip bots (including ourselves)
         if (this.userStreams.has(userId)) continue;
-        console.log(`[VoiceWorker] Pre-subscribing to member already in channel: ${userId}`);
+
+        console.log(
+          `[VoiceWorker] Pre-subscribing to member already in channel: ${userId}`
+        );
+
         this.startUserStream(userId, receiver);
       }
     } catch (err) {
-      console.error('[VoiceWorker] Failed to pre-subscribe existing members:', err);
+      console.error(
+        '[VoiceWorker] Failed to pre-subscribe existing members:',
+        err
+      );
     }
   }
 
   private startUserStream(userId: string, receiver: any): void {
+    // Final safety guard: no bot should ever reach receiver.subscribe().
+    // This protects every caller of startUserStream(), including both
+    // speaking.start and pre-subscription.
+    if (this.isBotUser(userId)) {
+      console.log(`[VoiceWorker] Refusing to record bot: ${userId}`);
+      return;
+    }
+
     const filePath = path.join(this.options.outputDir, `${userId}.pcm`);
+
     // Append mode: if the opus stream auto-closes on silence and restarts,
     // we don't lose earlier audio
     const writeStream = createWriteStream(filePath, { flags: 'a' });
@@ -200,6 +266,7 @@ export class VoiceWorker {
     // NOTE: Live transcription gets the raw decoded stream (without silence filling)
     // because Deepgram expects continuous speech, not padded silence.
     const live = this.options.liveTranscription;
+
     if (live) {
       let sendPcm: ((chunk: Buffer) => void) | null = null;
       let streamRequested = false;
@@ -214,19 +281,31 @@ export class VoiceWorker {
           sendPcm(chunk);
           return;
         }
+
         earlyBuffer.push(chunk);
+
         if (streamRequested) return;
+
         streamRequested = true;
+
         // Open Deepgram stream async, flush buffered audio when ready.
-        live.openStreamForUser(userId).then((send) => {
-          sendPcm = send;
-          for (const buf of earlyBuffer) {
-            sendPcm(buf);
-          }
-          earlyBuffer.length = 0;
-        }).catch((err) => {
-          console.error(`[VoiceWorker] Failed to open live stream for ${userId}:`, err);
-        });
+        live
+          .openStreamForUser(userId)
+          .then((send) => {
+            sendPcm = send;
+
+            for (const buf of earlyBuffer) {
+              sendPcm(buf);
+            }
+
+            earlyBuffer.length = 0;
+          })
+          .catch((err) => {
+            console.error(
+              `[VoiceWorker] Failed to open live stream for ${userId}:`,
+              err
+            );
+          });
       });
 
       // Silence-filled stream goes to the file for correct mixdown
@@ -248,10 +327,18 @@ export class VoiceWorker {
     // anchored to the first packet to keep speakers time-aligned.
     opusStream.on('data', () => {
       this.lastVoiceActivityAt = Date.now();
+
       if (!this.userFirstStart.has(userId)) {
         const startedAt = Date.now();
-        this.userFirstStart.set(userId, { filePath, startedAt });
-        console.log(`[VoiceWorker] First audio from user ${userId} at offset ${startedAt - this.sessionStartedAt}ms`);
+
+        this.userFirstStart.set(userId, {
+          filePath,
+          startedAt,
+        });
+
+        console.log(
+          `[VoiceWorker] First audio from user ${userId} at offset ${startedAt - this.sessionStartedAt}ms`
+        );
       }
     });
 
@@ -259,15 +346,22 @@ export class VoiceWorker {
 
     // If the opus stream auto-closes (e.g. ~30s silence despite Manual mode),
     // clean up so the next speaking event can re-subscribe.
+    //
     // Persist the SilenceFiller's last-chunk time so the next stream can fill
     // the gap between this stream's end and the next stream's start.
     opusStream.on('end', () => {
       const lastTime = silenceFiller.getLastChunkTime();
+
       if (lastTime > 0) {
         this.userLastChunkTime.set(userId, lastTime);
       }
-      console.log(`[VoiceWorker] Opus stream ended for user ${userId} (will re-subscribe on next speech)`);
+
+      console.log(
+        `[VoiceWorker] Opus stream ended for user ${userId} (will re-subscribe on next speech)`
+      );
+
       this.userStreams.delete(userId);
+
       // Close the Deepgram WS for this user so it doesn't timeout
       if (this.options.liveTranscription) {
         this.options.liveTranscription.closeStreamForUser(userId);
@@ -275,14 +369,22 @@ export class VoiceWorker {
     });
 
     const now = Date.now();
-    this.userStreams.set(userId, { filePath, writeStream, userId, startedAt: now });
+
+    this.userStreams.set(userId, {
+      filePath,
+      writeStream,
+      userId,
+      startedAt: now,
+    });
 
     // NOTE: userFirstStart is recorded on the first actual audio packet (see the
     // opusStream 'data' handler above), not here, so that pre-subscribed users
     // who are not yet speaking get an accurate start offset. Reconnections after
     // a silence timeout keep the original first-start (guarded by .has()).
     if (this.userFirstStart.has(userId)) {
-      console.log(`[VoiceWorker] Resumed recording user ${userId} (stream reconnected after silence)`);
+      console.log(
+        `[VoiceWorker] Resumed recording user ${userId} (stream reconnected after silence)`
+      );
     }
   }
 
