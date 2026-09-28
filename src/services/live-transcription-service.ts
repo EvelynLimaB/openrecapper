@@ -1,10 +1,24 @@
 import WebSocket from 'ws';
 import { Config } from '../config';
-import { TextChannel } from 'discord.js';
+import {
+  ButtonInteraction,
+  ColorResolvable,
+  EmbedBuilder,
+  StringSelectMenuInteraction,
+  TextChannel,
+  MessageFlags,
+} from 'discord.js';
+import {
+  CharacterModeService,
+  SpeakerPresentation,
+} from './character-mode-service';
 import { CampaignTermsService } from './campaign-terms-service';
 
 interface PendingTranscript {
+  userId: string;
   username: string;
+  label: string;
+  color: string;
   text: string;
   timestamp: number;
 }
@@ -26,7 +40,12 @@ export class LiveTranscriptionService {
   private lastAudioAt: Map<string, number> = new Map();
   private userNames: Map<string, string> = new Map();
 
+  // Live captions are posted to #legendas.
   private textChannel: TextChannel;
+  // Character controls and the final transcript live in #transcrição.
+  private transcriptChannel: TextChannel;
+  private voiceChannelId: string;
+  private sessionToken: string;
   private buffer: PendingTranscript[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private closed = false;
@@ -37,11 +56,25 @@ export class LiveTranscriptionService {
   // Keep Discord messages below the API limit.
   private static MAX_MESSAGE_LENGTH = 1900;
 
+  // Discord embed description maximum is 4096.
+  private static MAX_EMBED_DESCRIPTION_LENGTH = 3900;
+
+  // Keep total embed content safely below Discord's message limit.
+  private static MAX_EMBED_MESSAGE_LENGTH = 5800;
+
   // Deepgram recommends KeepAlive every 3-5 seconds during silence.
   private static KEEPALIVE_INTERVAL_MS = 4000;
 
-  constructor(textChannel: TextChannel) {
+  constructor(
+    textChannel: TextChannel,
+    transcriptChannel: TextChannel,
+    voiceChannelId: string,
+    sessionToken: string,
+  ) {
     this.textChannel = textChannel;
+    this.transcriptChannel = transcriptChannel;
+    this.voiceChannelId = voiceChannelId;
+    this.sessionToken = sessionToken;
   }
 
   /**
@@ -257,47 +290,102 @@ export class LiveTranscriptionService {
     });
   }
 
+  // A user can keep recording to Discord even when Deepgram closes its
+  // websocket unexpectedly (for example NET-0000). Keep the sender stable and
+  // reconnect the Deepgram side on the next audio packet instead of requiring
+  // VoiceWorker to create a new Discord subscription.
+  private connecting: Map<string, Promise<WebSocket>> = new Map();
+  private intentionallyClosedUsers: Set<string> = new Set();
+  private pendingAudio: Map<string, Buffer[]> = new Map();
+  private pendingAudioBytes: Map<string, number> = new Map();
+  private reconnectTimers: Map<string, NodeJS.Timeout> = new Map();
+  private reconnectAttempts: Map<string, number> = new Map();
+  private lastAudioProducedAt: Map<string, number> = new Map();
+
+  // Bound in-memory queue for audio produced while a reconnect is in flight.
+  // Final transcription always uses the PCM file, so this queue only protects
+  // the live captions path from unbounded memory growth during a bad outage.
+  private static MAX_PENDING_AUDIO_BYTES = 1024 * 1024;
+
   /**
-   * Open a Deepgram streaming WebSocket for a user and return
-   * a writable callback to send PCM audio data.
+   * Open a Deepgram streaming WebSocket for a user and return a stable sender.
+   * If Deepgram later closes the websocket unexpectedly, the sender will queue
+   * the next audio and transparently establish a replacement stream.
    */
   async openStreamForUser(
     userId: string,
   ): Promise<(pcmChunk: Buffer) => void> {
-    // Reuse an already-open stream for this user.
-    const existing = this.connections.get(userId);
+    this.intentionallyClosedUsers.delete(userId);
+    await this.ensureDeepgramStream(userId);
 
-    if (existing && existing.readyState === WebSocket.OPEN) {
-      console.log(
-        `[LiveTranscription] Reusing existing Deepgram stream for user ${userId}`,
-      );
+    return (pcmChunk: Buffer) => {
+      if (this.closed || pcmChunk.length === 0) {
+        return;
+      }
 
-      this.lastAudioAt.set(userId, Date.now());
-      this.startKeepAliveTimer(userId, existing);
+      this.lastAudioProducedAt.set(userId, Date.now());
 
-      return (pcmChunk: Buffer) => {
-        if (this.closed) {
+      const ws = this.connections.get(userId);
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(pcmChunk);
+          this.lastAudioAt.set(userId, Date.now());
           return;
+        } catch (err) {
+          console.error(
+            `[LiveTranscription] Failed to send PCM for user ${userId}:`,
+            err,
+          );
         }
+      }
 
-        if (existing.readyState === WebSocket.OPEN) {
-          try {
-            existing.send(pcmChunk);
-            this.lastAudioAt.set(userId, Date.now());
-          } catch (err) {
-            console.error(
-              `[LiveTranscription] Failed to send PCM for user ${userId}:`,
-              err,
-            );
-          }
-        }
-      };
+      this.queuePendingAudio(userId, pcmChunk);
+
+      void this.ensureDeepgramStream(userId)
+        .then(() => this.flushPendingAudio(userId))
+        .catch((err) => {
+          console.error(
+            `[LiveTranscription] Failed to reconnect live stream for user ${userId}:`,
+            err,
+          );
+        });
+    };
+  }
+
+  private async ensureDeepgramStream(userId: string): Promise<WebSocket> {
+    if (this.closed || this.intentionallyClosedUsers.has(userId)) {
+      throw new Error(
+        `[LiveTranscription] Live stream for ${userId} is closing`,
+      );
     }
 
+    const existing = this.connections.get(userId);
+    if (existing && existing.readyState === WebSocket.OPEN) {
+      return existing;
+    }
+
+    const inFlight = this.connecting.get(userId);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const promise = this.createDeepgramStream(userId);
+    this.connecting.set(userId, promise);
+
+    try {
+      return await promise;
+    } finally {
+      if (this.connecting.get(userId) === promise) {
+        this.connecting.delete(userId);
+      }
+    }
+  }
+
+  private async createDeepgramStream(userId: string): Promise<WebSocket> {
     const username = await this.resolveUsername(userId);
 
     let ws: WebSocket;
-
     const paramsWithKeyterms = this.buildDeepgramParams(true);
 
     try {
@@ -326,7 +414,6 @@ export class LiveTranscriptionService {
         }
 
         const fallbackParams = this.buildDeepgramParams(false);
-
         ws = await this.connectToDeepgram(
           fallbackParams,
           `${username} (without keyterms)`,
@@ -340,14 +427,42 @@ export class LiveTranscriptionService {
       }
     }
 
-    console.log(
-      `[LiveTranscription] Deepgram stream opened for ${username}`,
-    );
+    if (this.closed || this.intentionallyClosedUsers.has(userId)) {
+      try {
+        ws.close();
+      } catch {}
+      throw new Error(
+        `[LiveTranscription] Live stream for ${userId} closed during connection`,
+      );
+    }
+
+    const previous = this.connections.get(userId);
+    if (previous && previous !== ws) {
+      try {
+        if (previous.readyState === WebSocket.OPEN) {
+          previous.send(JSON.stringify({ type: 'CloseStream' }));
+        }
+      } catch {}
+      try {
+        previous.close();
+      } catch {}
+    }
 
     this.connections.set(userId, ws);
     this.lastAudioAt.set(userId, Date.now());
+    this.reconnectAttempts.delete(userId);
+    const reconnectTimer = this.reconnectTimers.get(userId);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      this.reconnectTimers.delete(userId);
+    }
     this.startFlushTimer();
     this.startKeepAliveTimer(userId, ws);
+    this.flushPendingAudio(userId);
+
+    console.log(
+      `[LiveTranscription] Deepgram stream opened for ${username}`,
+    );
 
     ws.on('message', (data: WebSocket.Data) => {
       try {
@@ -362,8 +477,19 @@ export class LiveTranscriptionService {
             msg.channel.alternatives[0].transcript?.trim();
 
           if (transcript) {
+            const presentation =
+              CharacterModeService.getPresentation(
+                this.textChannel.guild.id,
+                this.voiceChannelId,
+                userId,
+                username,
+              );
+
             this.buffer.push({
+              userId,
               username,
+              label: presentation.label,
+              color: presentation.color,
               text: transcript,
               timestamp: Date.now(),
             });
@@ -399,30 +525,149 @@ export class LiveTranscriptionService {
 
       this.clearKeepAliveTimer(userId);
       this.lastAudioAt.delete(userId);
-    });
 
-    return (pcmChunk: Buffer) => {
-      if (this.closed) {
-        return;
-      }
+      if (
+        !this.closed &&
+        !this.intentionallyClosedUsers.has(userId)
+      ) {
+        const normalizedReason = reasonText.toLowerCase();
+        const isNoAudioTimeout =
+          normalizedReason.includes('no_audio_timeout');
 
-      if (ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(pcmChunk);
+        const lastProduced = this.lastAudioProducedAt.get(userId) ?? 0;
+        const recentlyProducedAudio =
+          lastProduced > 0 &&
+          Date.now() - lastProduced <= 15000;
+        const hasPendingAudio =
+          (this.pendingAudioBytes.get(userId) ?? 0) > 0;
 
-          // Track when audio was last sent. Do NOT recreate the
-          // KeepAlive timer for every PCM packet.
-          this.lastAudioAt.set(userId, Date.now());
-        } catch (err) {
-          console.error(
-            `[LiveTranscription] Failed to send PCM for ${username}:`,
-            err,
+        // Deepgram documents 1011/NET-0000 as a transient streaming failure
+        // that should be recovered by creating a new WebSocket. Abnormal 1006
+        // closes are also retried when this user was recently producing audio.
+        // NET-0002/no_audio_timeout is intentionally left demand-driven: the
+        // next PCM packet will reopen the stream without holding an idle socket.
+        const shouldReconnect =
+          !isNoAudioTimeout &&
+          (code === 1011 || code === 1006) &&
+          (recentlyProducedAudio || hasPendingAudio);
+
+        if (shouldReconnect) {
+          console.warn(
+            `[LiveTranscription] Scheduling Deepgram reconnect for ${username} after unexpected close.`,
+          );
+          this.scheduleReconnect(userId, username);
+        } else {
+          console.warn(
+            `[LiveTranscription] Deepgram stream for ${username} ended unexpectedly; live transcription will reconnect when audio is produced again.`,
           );
         }
       }
-    };
+    });
+
+    return ws;
   }
 
+  private scheduleReconnect(userId: string, username: string): void {
+    if (
+      this.closed ||
+      this.intentionallyClosedUsers.has(userId) ||
+      this.reconnectTimers.has(userId)
+    ) {
+      return;
+    }
+
+    const attempt = this.reconnectAttempts.get(userId) ?? 0;
+    const delayMs = Math.min(
+      1000 * (2 ** attempt),
+      15000,
+    );
+
+    this.reconnectAttempts.set(userId, attempt + 1);
+
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(userId);
+
+      if (
+        this.closed ||
+        this.intentionallyClosedUsers.has(userId)
+      ) {
+        return;
+      }
+
+      void this.ensureDeepgramStream(userId)
+        .then(() => {
+          this.flushPendingAudio(userId);
+        })
+        .catch((err) => {
+          console.error(
+            `[LiveTranscription] Deepgram reconnect failed for ${username}; retrying:`,
+            err,
+          );
+          this.scheduleReconnect(userId, username);
+        });
+    }, delayMs);
+
+    this.reconnectTimers.set(userId, timer);
+
+    console.log(
+      `[LiveTranscription] Deepgram reconnect for ${username} scheduled in ${delayMs}ms (attempt ${attempt + 1}).`,
+    );
+  }
+
+  private queuePendingAudio(userId: string, chunk: Buffer): void {
+    const queue = this.pendingAudio.get(userId) ?? [];
+    const previousBytes = this.pendingAudioBytes.get(userId) ?? 0;
+
+    queue.push(chunk);
+    let nextBytes = previousBytes + chunk.length;
+
+    while (
+      nextBytes > LiveTranscriptionService.MAX_PENDING_AUDIO_BYTES &&
+      queue.length > 0
+    ) {
+      const removed = queue.shift()!;
+      nextBytes -= removed.length;
+    }
+
+    this.pendingAudio.set(userId, queue);
+    this.pendingAudioBytes.set(userId, nextBytes);
+  }
+
+  private flushPendingAudio(userId: string): void {
+    const ws = this.connections.get(userId);
+    const queue = this.pendingAudio.get(userId);
+
+    if (
+      !ws ||
+      ws.readyState !== WebSocket.OPEN ||
+      !queue ||
+      queue.length === 0
+    ) {
+      return;
+    }
+
+    this.pendingAudio.delete(userId);
+    this.pendingAudioBytes.delete(userId);
+
+    for (let i = 0; i < queue.length; i++) {
+      const chunk = queue[i];
+
+      try {
+        ws.send(chunk);
+        this.lastAudioAt.set(userId, Date.now());
+      } catch (err) {
+        for (let j = i; j < queue.length; j++) {
+          this.queuePendingAudio(userId, queue[j]);
+        }
+
+        console.error(
+          `[LiveTranscription] Failed flushing queued PCM for user ${userId}:`,
+          err,
+        );
+        break;
+      }
+    }
+  }
   // --- Deepgram KeepAlive management ---
 
   /**
@@ -497,7 +742,17 @@ export class LiveTranscriptionService {
 
     const items = this.buffer.splice(0);
 
-    // Group consecutive results by speaker.
+    if (!CharacterModeService.isEnabled()) {
+      await this.flushPlainText(items);
+      return;
+    }
+
+    await this.flushEmbeds(items);
+  }
+
+  private async flushPlainText(
+    items: PendingTranscript[],
+  ): Promise<void> {
     const lines: string[] = [];
     let lastUser = '';
 
@@ -505,12 +760,11 @@ export class LiveTranscriptionService {
       if (item.username !== lastUser) {
         lines.push(`**${item.username}:** ${item.text}`);
         lastUser = item.username;
-      } else {
+      } else if (lines.length > 0) {
         lines[lines.length - 1] += ` ${item.text}`;
       }
     }
 
-    // Split into Discord-safe messages.
     let message = '';
 
     for (const line of lines) {
@@ -532,6 +786,396 @@ export class LiveTranscriptionService {
     }
   }
 
+  private splitTranscriptText(text: string): string[] {
+    if (
+      text.length <=
+      LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH
+    ) {
+      return [text];
+    }
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (
+      remaining.length >
+      LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH
+    ) {
+      let splitAt = remaining.lastIndexOf(
+        ' ',
+        LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH,
+      );
+
+      if (splitAt <= 0) {
+        splitAt =
+          LiveTranscriptionService.MAX_EMBED_DESCRIPTION_LENGTH;
+      }
+
+      chunks.push(remaining.slice(0, splitAt).trim());
+      remaining = remaining.slice(splitAt).trim();
+    }
+
+    if (remaining) {
+      chunks.push(remaining);
+    }
+
+    return chunks;
+  }
+
+  private async flushEmbeds(
+    items: PendingTranscript[],
+  ): Promise<void> {
+    interface EmbedGroup {
+      label: string;
+      color: string;
+      text: string;
+    }
+
+    const groups: EmbedGroup[] = [];
+
+    for (const item of items) {
+      const last = groups[groups.length - 1];
+
+      if (
+        last &&
+        last.label === item.label &&
+        last.color === item.color
+      ) {
+        last.text += ` ${item.text}`;
+      } else {
+        groups.push({
+          label: item.label,
+          color: item.color,
+          text: item.text,
+        });
+      }
+    }
+
+    let embeds: EmbedBuilder[] = [];
+    let totalLength = 0;
+
+    const sendEmbeds = async (): Promise<void> => {
+      if (embeds.length === 0) {
+        return;
+      }
+
+      try {
+        await this.textChannel.send({
+          embeds,
+        });
+      } catch (err) {
+        console.error(
+          '[LiveTranscription] Failed to post embeds to channel:',
+          err,
+        );
+      }
+
+      embeds = [];
+      totalLength = 0;
+    };
+
+    for (const group of groups) {
+      const chunks = this.splitTranscriptText(group.text);
+
+      for (const chunk of chunks) {
+        const estimatedLength =
+          group.label.length + chunk.length;
+
+        if (
+          embeds.length >= 10 ||
+          totalLength + estimatedLength >
+            LiveTranscriptionService.MAX_EMBED_MESSAGE_LENGTH
+        ) {
+          await sendEmbeds();
+        }
+
+        const embed = new EmbedBuilder()
+          .setAuthor({ name: group.label })
+          .setDescription(chunk)
+          .setColor(group.color as ColorResolvable);
+
+        embeds.push(embed);
+        totalLength += estimatedLength;
+      }
+    }
+
+    await sendEmbeds();
+  }
+
+  getPresentationSnapshot(): Map<string, SpeakerPresentation> {
+    return CharacterModeService.buildPresentationMap(
+      this.textChannel.guild.id,
+      this.voiceChannelId,
+      this.userNames,
+    );
+  }
+
+  async postCharacterModePanel(): Promise<void> {
+    if (!CharacterModeService.isEnabled()) {
+      return;
+    }
+
+    const dmUserIds = CharacterModeService.getDmUserIds();
+
+    if (dmUserIds.length === 0) {
+      return;
+    }
+
+    const userId = dmUserIds[0];
+
+    try {
+      await this.transcriptChannel.send({
+        content: CharacterModeService.buildPanelContent(
+          this.transcriptChannel.guild.id,
+          this.voiceChannelId,
+          userId,
+        ),
+        components:
+          CharacterModeService.buildPanelComponents(
+            this.voiceChannelId,
+            this.sessionToken,
+          ),
+      });
+    } catch (err) {
+      console.error(
+        '[LiveTranscription] Failed to post character mode panel:',
+        err,
+      );
+    }
+  }
+
+  async handleCharacterModeButton(
+    interaction: ButtonInteraction,
+  ): Promise<void> {
+    const buttonVoiceChannelId =
+      CharacterModeService.voiceChannelIdFromButton(
+        interaction.customId,
+      );
+
+    const buttonSessionToken =
+      CharacterModeService.sessionTokenFromButton(
+        interaction.customId,
+      );
+
+    if (
+      buttonVoiceChannelId !== this.voiceChannelId ||
+      buttonSessionToken !== this.sessionToken
+    ) {
+      await interaction.reply({
+        content:
+          'Este painel pertence a uma gravação anterior.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (
+      CharacterModeService.isChooseCharacterButton(
+        interaction.customId,
+      )
+    ) {
+      if (CharacterModeService.isDmUser(interaction.user.id)) {
+        await interaction.reply({
+          content:
+            'A DM deve usar os controles de modo da própria DM.',
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.reply({
+        content:
+          'Selecione seu personagem para esta sessão.',
+        components:
+          CharacterModeService.buildPlayerSelectionComponents(
+            interaction.guildId ?? this.textChannel.guild.id,
+            this.voiceChannelId,
+            this.sessionToken,
+            interaction.user.id,
+          ),
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (!CharacterModeService.isDmUser(interaction.user.id)) {
+      await interaction.reply({
+        content:
+          'Apenas a DM configurada pode alterar o modo de fala.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const parsed = CharacterModeService.modeFromButton(
+      interaction.customId,
+    );
+
+    if (!parsed) {
+      await interaction.reply({
+        content: 'Modo de fala inválido.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (
+      parsed.mode === 'character' &&
+      !parsed.characterName
+    ) {
+      await interaction.reply({
+        content: 'Personagem inválido.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (
+      parsed.mode === 'character' &&
+      !CharacterModeService.getCharacter(
+        parsed.characterName!,
+      )
+    ) {
+      await interaction.reply({
+        content: 'Esse personagem não está configurado.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (
+      parsed.mode === 'npc' &&
+      !CharacterModeService.getCharacter('NPC')
+    ) {
+      await interaction.reply({
+        content: 'NPC não está configurado.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    CharacterModeService.setMode(
+      interaction.guildId ?? this.textChannel.guild.id,
+      this.voiceChannelId,
+      interaction.user.id,
+      parsed.mode,
+      parsed.characterName,
+    );
+
+    await interaction.update({
+      content: CharacterModeService.buildPanelContent(
+        interaction.guildId ?? this.textChannel.guild.id,
+        this.voiceChannelId,
+        interaction.user.id,
+      ),
+      components:
+        CharacterModeService.buildPanelComponents(
+          this.voiceChannelId,
+          this.sessionToken,
+        ),
+    });
+  }
+
+  async handleCharacterModeSelect(
+    interaction: StringSelectMenuInteraction,
+  ): Promise<void> {
+    const selectVoiceChannelId =
+      CharacterModeService.voiceChannelIdFromButton(
+        interaction.customId,
+      );
+
+    const selectSessionToken =
+      CharacterModeService.sessionTokenFromButton(
+        interaction.customId,
+      );
+
+    if (
+      selectVoiceChannelId !== this.voiceChannelId ||
+      selectSessionToken !== this.sessionToken
+    ) {
+      await interaction.reply({
+        content:
+          'Este painel pertence a uma gravação anterior.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (CharacterModeService.isDmUser(interaction.user.id)) {
+      await interaction.reply({
+        content:
+          'A DM deve usar os controles de modo da própria DM.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const rawValue = interaction.values[0];
+
+    if (!rawValue) {
+      await interaction.reply({
+        content: 'Nenhum personagem foi selecionado.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    let selectedName: string | null = null;
+
+    if (rawValue !== 'none') {
+      try {
+        selectedName = decodeURIComponent(rawValue);
+      } catch {
+        await interaction.reply({
+          content: 'Seleção de personagem inválida.',
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+    }
+
+    const result =
+      CharacterModeService.assignPlayerCharacter(
+        interaction.guildId ?? this.textChannel.guild.id,
+        this.voiceChannelId,
+        interaction.user.id,
+        selectedName,
+      );
+
+    if (!result.ok) {
+      if (result.reason === 'reserved') {
+        await interaction.reply({
+          content:
+            `O personagem **${result.character?.name ?? selectedName}** já está sendo usado por outro jogador nesta sessão.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.reply({
+        content:
+          'Esse personagem não pode ser selecionado por jogadores.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (result.character) {
+      await interaction.reply({
+        content:
+          `Seu personagem nesta sessão agora é **${result.character.name}**.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await interaction.reply({
+      content:
+        'Seu personagem foi removido. A transcrição voltará a usar seu nome do Discord.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   private async postToChannel(
     content: string,
   ): Promise<void> {
@@ -549,8 +1193,20 @@ export class LiveTranscriptionService {
    * Close a single user's Deepgram WebSocket.
    */
   closeStreamForUser(userId: string): void {
+    this.intentionallyClosedUsers.add(userId);
     this.clearKeepAliveTimer(userId);
     this.lastAudioAt.delete(userId);
+    this.lastAudioProducedAt.delete(userId);
+
+    const reconnectTimer = this.reconnectTimers.get(userId);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      this.reconnectTimers.delete(userId);
+    }
+
+    this.reconnectAttempts.delete(userId);
+    this.pendingAudio.delete(userId);
+    this.pendingAudioBytes.delete(userId);
 
     const ws = this.connections.get(userId);
 
@@ -614,6 +1270,11 @@ export class LiveTranscriptionService {
     }
 
     this.connections.clear();
+
+    CharacterModeService.clearSession(
+      this.textChannel.guild.id,
+      this.voiceChannelId,
+    );
 
     console.log('[LiveTranscription] All streams closed');
   }

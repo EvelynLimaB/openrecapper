@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, Events, Collection, Interaction, VoiceState, Partials, MessageReaction, PartialMessageReaction, User, PartialUser } from 'discord.js';
+import { Client, GatewayIntentBits, Events, Collection, Interaction, VoiceState, Partials, MessageReaction, PartialMessageReaction, User, PartialUser, MessageFlags } from 'discord.js';
 import { Config, validateConfig } from './config';
 import { setClient } from './client';
 import { recordCommand } from './commands/record';
@@ -11,6 +11,7 @@ import { setSummaryChannelCommand } from './commands/set-summary-channel';
 import { openrecapperIssueCommand } from './commands/openrecapper-issue';
 import { WorkerManager } from './services/worker-manager';
 import { RecorderPool } from './services/recorder-pool';
+import { CharacterModeService } from './services/character-mode-service';
 import { testScheduleCommand } from './commands/test-schedule';
 import { startScheduler, stopScheduler } from './services/scheduler';
 import { loadGrapevineConfig, handleReactionAdd } from './services/grapevine-service';
@@ -104,6 +105,78 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     return;
   }
 
+  if (
+    (interaction.isButton() ||
+      interaction.isStringSelectMenu()) &&
+    CharacterModeService.isCharacterModeComponent(
+      interaction.customId,
+    )
+  ) {
+    const voiceChannelId =
+      CharacterModeService.voiceChannelIdFromButton(
+        interaction.customId,
+      );
+
+    if (!voiceChannelId) {
+      await interaction.reply({
+        content: 'Painel de modo inválido.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const session =
+      WorkerManager
+        .getInstance()
+        .getSession(voiceChannelId);
+
+    if (!session?.liveTranscription) {
+      await interaction.reply({
+        content:
+          'A gravação desta sessão não está mais ativa.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    try {
+      if (interaction.isButton()) {
+        await session.liveTranscription.handleCharacterModeButton(
+          interaction,
+        );
+      } else if (
+        interaction.isStringSelectMenu() &&
+        CharacterModeService.isCharacterSelectionMenu(
+          interaction.customId,
+        )
+      ) {
+        await session.liveTranscription.handleCharacterModeSelect(
+          interaction,
+        );
+      } else {
+        await interaction.reply({
+          content: 'Componente de personagem inválido.',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+    } catch (err) {
+      console.error(
+        '[Interaction] Character mode component error:',
+        err,
+      );
+
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content:
+            'Não foi possível atualizar o modo de fala.',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+    }
+
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   console.log(`[Interaction] Command: /${interaction.commandName}`);
@@ -114,7 +187,10 @@ client.on(Events.InteractionCreate, async (interaction: Interaction) => {
     await command.execute(interaction);
   } catch (error) {
     console.error(`Error executing /${interaction.commandName}:`, error);
-    const reply = { content: '❌ An error occurred.', ephemeral: true };
+    const reply = {
+      content: '\u274c An error occurred.',
+      flags: MessageFlags.Ephemeral as const,
+    };
     if (interaction.replied || interaction.deferred) {
       await interaction.followUp(reply);
     } else {

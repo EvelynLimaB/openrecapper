@@ -19,6 +19,36 @@ const recordMeetingNames = (process.env.RECORD_MEETING_NAMES || 'UNNAMED-MEETING
   .filter(Boolean);
 if (recordMeetingNames.length === 0) recordMeetingNames.push('UNNAMED-MEETING');
 
+const characterDmUserIds = (process.env.CHARACTER_DM_USER_IDS || '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
+
+const characterDefinitionsRaw =
+  process.env.CHARACTER_DEFINITIONS ||
+  'Kasane:E74C3C,Shiki:F1C40F,Conrad:000000,Guava:E67E22,Arsene:3498DB,Mello:795548,NPC:2ECC71';
+
+const characterDefinitions = characterDefinitionsRaw
+  .split(',')
+  .map((entry) => {
+    const [nameRaw, colorRaw] = entry.split(':', 2);
+    const name = nameRaw?.trim() || '';
+    const color = colorRaw?.trim().replace(/^#/, '') || '';
+
+    if (!name || !/^[0-9A-Fa-f]{6}$/.test(color)) {
+      return null;
+    }
+
+    return {
+      name,
+      color: `#${color.toUpperCase()}`,
+    };
+  })
+  .filter(
+    (entry): entry is { name: string; color: string } =>
+      entry !== null,
+  );
+
 export const Config = {
   DISCORD_TOKENS: tokens,
   // Primary token — kept so existing single-token call sites
@@ -79,6 +109,23 @@ export const Config = {
   // Discord user IDs (comma-separated) to cc/@-mention at the end of the public
   // reply when an issue is filed. Empty = no cc line.
   ISSUE_CC_USER_IDS: process.env.ISSUE_CC_USER_IDS || '',
+  // Live RPG character presentation. Empty = feature disabled.
+  CHARACTER_DM_USER_IDS: characterDmUserIds,
+  // Discord text channels used by live RPG presentation. Names are configurable.
+  LIVE_CAPTIONS_CHANNEL_NAME: process.env.LIVE_CAPTIONS_CHANNEL_NAME || 'legendas',
+  TRANSCRIPT_CHANNEL_NAME: process.env.TRANSCRIPT_CHANNEL_NAME || 'transcrição',
+  CHARACTER_DEFINITIONS:
+    characterDefinitions.length > 0
+      ? characterDefinitions
+      : [
+          { name: 'Kasane', color: '#E74C3C' },
+          { name: 'Shiki', color: '#F1C40F' },
+          { name: 'Conrad', color: '#000000' },
+          { name: 'Guava', color: '#E67E22' },
+          { name: 'Arsene', color: '#3498DB' },
+          { name: 'Mello', color: '#795548' },
+          { name: 'NPC', color: '#2ECC71' },
+        ],
 };
 
 export function validateConfig() {

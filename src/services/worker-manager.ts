@@ -4,6 +4,7 @@ import { StorageService } from './storage-service';
 import { SummaryService } from './summary-service';
 import { RelayClient } from './relay-client';
 import { LiveTranscriptionService } from './live-transcription-service';
+import { CharacterModeService, SpeakerPresentation } from './character-mode-service';
 import { RecorderPool, RecorderLease, NoRecorderAvailableError } from './recorder-pool';
 import { Config } from '../config';
 import { TextChannel, MessageCreateOptions } from 'discord.js';
@@ -19,6 +20,8 @@ export interface RecordingSession {
   callName: string;
   worker: VoiceWorker;
   liveTranscription: LiveTranscriptionService | null;
+  // Snapshot taken before live transcription closes/clears session-only RPG state.
+  finalSpeakerPresentations: Map<string, SpeakerPresentation> | null;
   startedAt: number;
   silenceCheckTimer: ReturnType<typeof setInterval> | null;
   sessionDir: string;
@@ -138,6 +141,42 @@ export class WorkerManager {
     return WorkerManager.instance;
   }
 
+  /** Find a guild text channel by its configured name. */
+  private async findGuildTextChannel(
+    guildId: string,
+    channelName: string,
+  ): Promise<TextChannel | null> {
+    const { getClient } = require('../client');
+    const client = getClient();
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) return null;
+
+    const wanted = channelName.trim().toLowerCase();
+    if (!wanted) return null;
+
+    try {
+      const channels = await guild.channels.fetch();
+      const match = channels.find((channel: any) => {
+        if (!channel?.isTextBased?.() || !('send' in channel)) {
+          return false;
+        }
+        return (
+          'name' in channel &&
+          typeof channel.name === 'string' &&
+          channel.name.trim().toLowerCase() === wanted
+        );
+      });
+
+      return (match && 'send' in match ? match : null) as TextChannel | null;
+    } catch (err) {
+      console.error(
+        `[WorkerManager] Failed to find #${channelName} in guild ${guildId}:`,
+        err,
+      );
+      return null;
+    }
+  }
+
   async startRecording(options: StartRecordingOptions): Promise<void> {
     // Reserve the target CHANNEL synchronously — before any await can run — so
     // two near-simultaneous starts for the same channel cannot both proceed
@@ -159,24 +198,69 @@ export class WorkerManager {
     // reservation is cleared in `finally` (on success the session in `sessions`
     // takes over as the authoritative reservation).
     try {
+      const sessionStartedAt = Date.now();
       const sessionDir = path.join(
         Config.RECORDINGS_DIR,
-        `${options.guildId}_${options.channelId}_${Date.now()}`
+        `${options.guildId}_${options.channelId}_${sessionStartedAt}`
       );
       fs.mkdirSync(sessionDir, { recursive: true });
 
-      // Set up live transcription in the explicit invocation/schedule text channel.
+      // Short token for Discord component custom IDs. The full session directory
+      // name is intentionally not used because Discord limits custom IDs to 100 chars.
+      const sessionToken = sessionStartedAt.toString(36);
+
+      // RPG presentation uses dedicated channels so live captions never mix with
+      // the character controls or the finalized transcript.
       let liveTranscription: LiveTranscriptionService | null = null;
       try {
         const { getClient } = require('../client');
         const client = getClient();
-        const guild = client.guilds.cache.get(options.guildId);
-        if (guild) {
-          const targetChannel = await client.channels.fetch(options.textChannelId) as TextChannel;
-          if (targetChannel?.isTextBased?.()) {
-            liveTranscription = new LiveTranscriptionService(targetChannel as TextChannel);
-            console.log(`[WorkerManager] Live transcription will post to #${targetChannel.name}`);
-          }
+        const fallbackChannel = await client.channels.fetch(options.textChannelId) as TextChannel;
+        const fallback = fallbackChannel?.isTextBased?.()
+          ? (fallbackChannel as TextChannel)
+          : null;
+
+        const useDedicatedRpgChannels = CharacterModeService.isEnabled();
+        const captionsChannel =
+          (useDedicatedRpgChannels
+            ? await this.findGuildTextChannel(
+                options.guildId,
+                Config.LIVE_CAPTIONS_CHANNEL_NAME,
+              )
+            : null) || fallback;
+        const transcriptChannel =
+          (useDedicatedRpgChannels
+            ? await this.findGuildTextChannel(
+                options.guildId,
+                Config.TRANSCRIPT_CHANNEL_NAME,
+              )
+            : null) || fallback;
+
+        if (captionsChannel && transcriptChannel) {
+          liveTranscription = new LiveTranscriptionService(
+            captionsChannel,
+            transcriptChannel,
+            options.channelId,
+            sessionToken,
+          );
+          console.log(
+            `[WorkerManager] RPG live captions -> #${captionsChannel.name}; controls/final transcript -> #${transcriptChannel.name}`,
+          );
+        }
+
+        if (!captionsChannel) {
+          console.warn(
+            '[WorkerManager] No text-channel fallback is available; live transcription disabled.',
+          );
+        } else if (
+          useDedicatedRpgChannels &&
+          (!transcriptChannel ||
+            transcriptChannel.name.trim().toLowerCase() !==
+              Config.TRANSCRIPT_CHANNEL_NAME.trim().toLowerCase())
+        ) {
+          console.warn(
+            `[WorkerManager] #${Config.TRANSCRIPT_CHANNEL_NAME} not found; character controls/final transcript will fall back to #${captionsChannel.name}.`,
+          );
         }
       } catch (err) {
         console.error('[WorkerManager] Failed to set up live transcription:', err);
@@ -206,13 +290,19 @@ export class WorkerManager {
         callName,
         worker,
         liveTranscription,
-        startedAt: Date.now(),
+        finalSpeakerPresentations: null,
+        startedAt: sessionStartedAt,
         silenceCheckTimer: null,
         sessionDir,
         activeMarkerPath,
         lease,
       };
       this.sessions.set(options.channelId, session);
+
+      // The session is authoritative before interaction controls are published.
+      if (liveTranscription) {
+        await liveTranscription.postCharacterModePanel();
+      }
 
       // Start silence-timeout monitoring if configured
       this.startSilenceMonitor(session);
@@ -236,6 +326,12 @@ export class WorkerManager {
     if (session.silenceCheckTimer) {
       clearInterval(session.silenceCheckTimer);
       session.silenceCheckTimer = null;
+    }
+
+    // Snapshot RPG presentation before close() clears the session-only state.
+    if (session.liveTranscription) {
+      session.finalSpeakerPresentations =
+        session.liveTranscription.getPresentationSnapshot();
     }
 
     // Close live transcription streams first to flush final results
@@ -276,23 +372,39 @@ export class WorkerManager {
     const { getClient } = require('../client');
     const client = getClient();
 
-    // Resolve the text channel to post results. If the guild has configured a
-    // dedicated summary channel via /set-summary-channel, prefer that; otherwise
-    // fall back to the channel where /record was invoked (default behaviour).
+    // Final RPG transcript delivery belongs in the dedicated #transcrição channel.
+    // Keep the existing summary-channel override as the fallback for installations
+    // that do not have the dedicated RPG channel.
     const { getSummaryChannelForGuild } = require('./summary-channel-store');
     let targetChannelId = session.textChannelId;
+    let dedicatedTranscriptFound = false;
     try {
-      const overrideId = getSummaryChannelForGuild(session.guildId);
-      if (overrideId) targetChannelId = overrideId;
+      const transcriptChannel = await this.findGuildTextChannel(
+        session.guildId,
+        Config.TRANSCRIPT_CHANNEL_NAME,
+      );
+      if (transcriptChannel) {
+        targetChannelId = transcriptChannel.id;
+        dedicatedTranscriptFound = true;
+      }
     } catch (err) {
-      console.error('[WorkerManager] Could not read summary channel override:', err);
+      console.error('[WorkerManager] Could not resolve dedicated transcript channel:', err);
+    }
+
+    if (!dedicatedTranscriptFound) {
+      try {
+        const overrideId = getSummaryChannelForGuild(session.guildId);
+        if (overrideId) targetChannelId = overrideId;
+      } catch (err) {
+        console.error('[WorkerManager] Could not read summary channel override:', err);
+      }
     }
 
     let textChannel: any;
     try {
       textChannel = await client.channels.fetch(targetChannelId);
     } catch (err) {
-      console.error('[WorkerManager] Could not fetch summary channel, falling back to record channel:', err);
+      console.error('[WorkerManager] Could not fetch final transcript channel, falling back to record channel:', err);
       if (targetChannelId !== session.textChannelId) {
         try {
           textChannel = await client.channels.fetch(session.textChannelId);
@@ -310,7 +422,11 @@ export class WorkerManager {
       return;
     }
 
-    const artifacts = await this.prepareDeliveryArtifacts(stopResult, session, client);
+    const artifacts = await this.prepareDeliveryArtifacts(
+      stopResult,
+      session,
+      client,
+    );
     await this.postDeliveryMessage(textChannel, session, artifacts, client);
   }
 
@@ -328,7 +444,16 @@ export class WorkerManager {
     await this.pcmToWavStream(combinedPcmPath, combinedWavPath);
 
     const speakerNames = await this.resolveSpeakerNames(client, session.guildId, userMap);
-    const rosterHeader = this.buildRosterHeader(speakerNames);
+    const presentationUsers = new Map<string, string>();
+
+    for (const [userId, username] of speakerNames) {
+      presentationUsers.set(
+        userId,
+        session.finalSpeakerPresentations?.get(userId)?.label || username,
+      );
+    }
+
+    const rosterHeader = this.buildRosterHeader(presentationUsers);
 
     const transcriptionService = new TranscriptionService(Config.DEEPGRAM_API_KEY);
     const transcript = await this.transcribeWithRetry(
@@ -337,7 +462,7 @@ export class WorkerManager {
       userMap,
       userStartTimes,
       sessionStartedAt,
-      speakerNames,
+      presentationUsers,
       sessionDir,
     );
 
@@ -358,7 +483,9 @@ export class WorkerManager {
     if (transcript.ok) {
       transcriptText = transcript.value.text;
       transcriptSrt = transcript.value.srt;
-      speakerCount = new Set(transcript.value.segments.map((s) => s.speaker)).size;
+      // Count actual Discord speakers, not presentation labels. Two users can
+      // legally share a label when the DM impersonates a PC.
+      speakerCount = speakerNames.size;
 
       srtPath = path.join(sessionDir, 'transcript.srt');
       txtPath = path.join(sessionDir, 'transcript.txt');
@@ -378,7 +505,7 @@ export class WorkerManager {
 
       summaryPath = path.join(sessionDir, 'summary.md');
       try {
-        const participants = Array.from(speakerNames.values());
+        const participants = Array.from(presentationUsers.values());
         const generated = await SummaryService.summarize(rosterHeader + transcriptText, participants);
         if (generated) {
           const summaryDoc = `# ${session.callName} — Session Notes\n\n` +
@@ -536,7 +663,9 @@ export class WorkerManager {
       return {
         filePath,
         userId,
-        speakerName: speakerNames.get(userId) || `User ${userId.slice(-4)}`,
+        speakerName:
+          speakerNames.get(userId) ||
+          `User ${userId.slice(-4)}`,
         startedAt: userStartTimes.get(filePath) ?? sessionStartedAt,
       };
     });
@@ -1100,9 +1229,12 @@ export class WorkerManager {
       session.silenceCheckTimer = null;
     }
 
-    // Close live transcription streams
+    // Snapshot character presentation before close() clears the session state.
     if (session.liveTranscription) {
       try {
+        session.finalSpeakerPresentations =
+          session.liveTranscription.getPresentationSnapshot();
+
         await session.liveTranscription.close();
       } catch (err) {
         console.error('[SilenceMonitor] Error closing live transcription:', err);
