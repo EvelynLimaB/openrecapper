@@ -105,6 +105,8 @@ export class TranscriptionService {
       return { srt: '', text: 'No audio captured.', segments: [] };
     }
 
+    const params = this.buildPcmParams();
+
     // Fingerprint the input so checkpoints are never reused after an audio file,
     // speaker label, offset, or chunking configuration changes.
     const fingerprintInput = validTracks.map((track) => {
@@ -126,6 +128,7 @@ export class TranscriptionService {
         chunkSeconds: this.chunkSeconds,
         overlapSeconds: this.overlapSeconds,
         minSplitSeconds: this.minSplitSeconds,
+        requestParams: params.toString(),
         tracks: fingerprintInput,
       }))
       .digest('hex')
@@ -135,7 +138,6 @@ export class TranscriptionService {
     const progressDir = path.join(progressBase, `v1-${fingerprint}`);
     fs.mkdirSync(progressDir, { recursive: true });
 
-    const params = this.buildPcmParams();
     console.log(
       `[Transcription] Transcribing ${validTracks.length} per-user track(s) with Deepgram Nova-3; ` +
       `blocks=${this.chunkSeconds}s, overlap=${this.overlapSeconds}s, checkpoints=${progressDir}`,
@@ -310,7 +312,31 @@ export class TranscriptionService {
             track, trackId, trackOffsetSeconds, totalBytes,
             midpointByte, coreEndByte, params, progressDir,
           );
-          return [...left, ...right];
+
+          // Cache the completed parent range too. Without this, a resumed run
+          // would repeat the original request that returned 504 before reusing
+          // the successful child checkpoints.
+          const splitSegments = [...left, ...right];
+          const splitCheckpoint: ChunkCheckpoint = {
+            version: 1,
+            startByte: coreStartByte,
+            endByte: coreEndByte,
+            segments: splitSegments,
+          };
+          const splitTemporaryPath = `${checkpointPath}.${process.pid}.tmp`;
+          try {
+            fs.writeFileSync(splitTemporaryPath, JSON.stringify(splitCheckpoint), 'utf8');
+            fs.renameSync(splitTemporaryPath, checkpointPath);
+          } finally {
+            if (fs.existsSync(splitTemporaryPath)) {
+              fs.rmSync(splitTemporaryPath, { force: true });
+            }
+          }
+          console.log(
+            `[Transcription] Saved completed split checkpoint for ${track.speakerName}: ` +
+            `bytes ${coreStartByte}-${coreEndByte}`,
+          );
+          return splitSegments;
         }
       }
 

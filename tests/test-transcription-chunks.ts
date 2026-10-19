@@ -193,6 +193,11 @@ async function test504AdaptiveSplit(): Promise<void> {
     assert(calls.length === 3, 'Initial 504 block is retried as two smaller blocks');
     assert(result.segments.length === 2, 'Both smaller blocks contribute a segment');
     assert(result.segments.every((segment) => segment.speaker === 'Conrad'), 'Speaker attribution survives adaptive splitting');
+
+    const callsBeforeResume = calls.length;
+    const resumed = await service.transcribeUserTracks([track], sessionStart, progressDir);
+    assert(calls.length === callsBeforeResume, 'Resuming after adaptive split reuses the completed parent checkpoint without a new 504');
+    assert(resumed.srt === result.srt, 'Adaptive-split resume produces identical SRT output');
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(tmpDir, { recursive: true, force: true });
