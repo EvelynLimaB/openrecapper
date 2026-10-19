@@ -676,7 +676,14 @@ export class WorkerManager {
           console.log('[WorkerManager] Retrying per-user Deepgram transcription after backoff');
           await WorkerManager.sleep(10_000);
         }
-        return { ok: true, value: await transcriptionService.transcribeUserTracks(tracks, sessionStartedAt) };
+        return {
+          ok: true,
+          value: await transcriptionService.transcribeUserTracks(
+            tracks,
+            sessionStartedAt,
+            path.join(sessionDir, 'transcription-progress'),
+          ),
+        };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[WorkerManager] Per-user Deepgram transcription attempt ${attempt}/2 failed for ${sessionDir}:`, err);

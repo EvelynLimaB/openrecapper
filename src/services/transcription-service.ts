@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { CampaignTermsService } from './campaign-terms-service';
 
 interface Segment {
@@ -15,6 +16,35 @@ interface TranscriptResult {
   segments: Segment[];
 }
 
+interface TranscriptionServiceOptions {
+  /** Maximum duration of each normal PCM block, in seconds. */
+  chunkSeconds?: number;
+  /** Audio overlap around each block boundary, in seconds. */
+  overlapSeconds?: number;
+  /** A 504 response triggers recursive splitting down to this duration. */
+  minSplitSeconds?: number;
+}
+
+class DeepgramRequestError extends Error {
+  constructor(public readonly statusCode: number, body: string) {
+    super(`Deepgram API error ${statusCode}: ${body}`);
+    this.name = 'DeepgramRequestError';
+  }
+}
+
+interface ChunkCheckpoint {
+  version: 1;
+  startByte: number;
+  endByte: number;
+  segments: Segment[];
+}
+
+const PCM_SAMPLE_RATE = 48000;
+const PCM_CHANNELS = 2;
+const PCM_BYTES_PER_SAMPLE = 2;
+const PCM_FRAME_BYTES = PCM_CHANNELS * PCM_BYTES_PER_SAMPLE;
+const PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_FRAME_BYTES;
+
 export interface UserTrackInput {
   filePath: string;
   userId: string;
@@ -25,9 +55,25 @@ export interface UserTrackInput {
 
 export class TranscriptionService {
   private apiKey: string;
+  private chunkSeconds: number;
+  private overlapSeconds: number;
+  private minSplitSeconds: number;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, options: TranscriptionServiceOptions = {}) {
     this.apiKey = apiKey;
+    this.chunkSeconds = options.chunkSeconds ?? 300;
+    this.overlapSeconds = options.overlapSeconds ?? 2;
+    this.minSplitSeconds = options.minSplitSeconds ?? 30;
+
+    if (!Number.isInteger(this.chunkSeconds) || this.chunkSeconds < 1) {
+      throw new Error('chunkSeconds must be a positive integer.');
+    }
+    if (!Number.isFinite(this.overlapSeconds) || this.overlapSeconds < 0) {
+      throw new Error('overlapSeconds must be a non-negative number.');
+    }
+    if (!Number.isFinite(this.minSplitSeconds) || this.minSplitSeconds <= 0) {
+      throw new Error('minSplitSeconds must be a positive number.');
+    }
   }
 
   /**
@@ -41,6 +87,7 @@ export class TranscriptionService {
   async transcribeUserTracks(
     tracks: UserTrackInput[],
     sessionStartedAt: number,
+    checkpointRoot?: string,
   ): Promise<TranscriptResult> {
     const segments: Segment[] = [];
     const validTracks = tracks.filter((track) => {
@@ -58,22 +105,58 @@ export class TranscriptionService {
       return { srt: '', text: 'No audio captured.', segments: [] };
     }
 
-    console.log(`[Transcription] Transcribing ${validTracks.length} per-user track(s) with Deepgram Nova-3`);
+    // Fingerprint the input so checkpoints are never reused after an audio file,
+    // speaker label, offset, or chunking configuration changes.
+    const fingerprintInput = validTracks.map((track) => {
+      const stats = fs.statSync(track.filePath);
+      return {
+        file: path.basename(track.filePath),
+        size: stats.size,
+        mtimeMs: stats.mtimeMs,
+        userId: track.userId,
+        speakerName: track.speakerName,
+        startedAt: track.startedAt,
+      };
+    });
+    const fingerprint = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({
+        version: 1,
+        sessionStartedAt,
+        chunkSeconds: this.chunkSeconds,
+        overlapSeconds: this.overlapSeconds,
+        minSplitSeconds: this.minSplitSeconds,
+        tracks: fingerprintInput,
+      }))
+      .digest('hex')
+      .slice(0, 20);
+    const progressBase = checkpointRoot ||
+      path.join(path.dirname(validTracks[0].filePath), 'transcription-progress');
+    const progressDir = path.join(progressBase, `v1-${fingerprint}`);
+    fs.mkdirSync(progressDir, { recursive: true });
 
-    // Sequential calls are gentler on Deepgram/rate limits and make logs easier
-    // to follow. Correct attribution is more important than shaving seconds here.
+    const params = this.buildPcmParams();
+    console.log(
+      `[Transcription] Transcribing ${validTracks.length} per-user track(s) with Deepgram Nova-3; ` +
+      `blocks=${this.chunkSeconds}s, overlap=${this.overlapSeconds}s, checkpoints=${progressDir}`,
+    );
+
+    // Sequential calls limit concurrent API load. Every successful core block
+    // is persisted so a later request failure does not discard completed work.
     for (const track of validTracks) {
       const offsetSeconds = Math.max(0, (track.startedAt - sessionStartedAt) / 1000);
-      const trackSegments = await this.transcribePcmTrack(track, offsetSeconds);
+      const trackSegments = await this.transcribeTrackInChunks(
+        track,
+        offsetSeconds,
+        params,
+        progressDir,
+      );
       segments.push(...trackSegments);
     }
 
-    // Sort segments chronologically. When speakers overlap, keep a stable-ish
-    // order by end time then speaker name to avoid nondeterministic output.
     segments.sort((a, b) =>
       a.start - b.start || a.end - b.end || a.speaker.localeCompare(b.speaker),
     );
-
     console.log(`[Transcription] Got ${segments.length} named segment(s) from Deepgram`);
 
     return {
@@ -81,6 +164,196 @@ export class TranscriptionService {
       text: this.toPlainText(segments),
       segments,
     };
+  }
+
+  private buildPcmParams(): URLSearchParams {
+    const params = new URLSearchParams({
+      model: 'nova-3',
+      language: 'multi',
+      encoding: 'linear16',
+      sample_rate: '48000',
+      channels: '2',
+      smart_format: 'true',
+      utterances: 'true',
+      punctuate: 'true',
+      paragraphs: 'true',
+    });
+
+    const campaignTerms = CampaignTermsService.load();
+    CampaignTermsService.applyToParams(params, campaignTerms);
+    return params;
+  }
+
+  private async transcribeTrackInChunks(
+    track: UserTrackInput,
+    trackOffsetSeconds: number,
+    params: URLSearchParams,
+    progressDir: string,
+  ): Promise<Segment[]> {
+    const stats = fs.statSync(track.filePath);
+    const totalBytes = Math.floor(stats.size / PCM_FRAME_BYTES) * PCM_FRAME_BYTES;
+    if (totalBytes !== stats.size) {
+      console.warn(
+        `[Transcription] ${path.basename(track.filePath)} has ${stats.size - totalBytes} trailing byte(s) ` +
+        'that do not form a complete stereo PCM frame; ignoring them.',
+      );
+    }
+
+    const trackId = (track.userId ||
+      path.basename(track.filePath, path.extname(track.filePath)))
+      .replace(/[^a-zA-Z0-9_-]/g, '_');
+    const coreBlockBytes = this.chunkSeconds * PCM_BYTES_PER_SECOND;
+    const trackSegments: Segment[] = [];
+
+    for (let startByte = 0; startByte < totalBytes; startByte += coreBlockBytes) {
+      const endByte = Math.min(totalBytes, startByte + coreBlockBytes);
+      const blockSegments = await this.transcribeRangeWithRecovery(
+        track,
+        trackId,
+        trackOffsetSeconds,
+        totalBytes,
+        startByte,
+        endByte,
+        params,
+        progressDir,
+      );
+      trackSegments.push(...blockSegments);
+    }
+
+    console.log(
+      `[Transcription] Completed ${track.speakerName}: ${trackSegments.length} segment(s) from ` +
+      `${Math.ceil(totalBytes / coreBlockBytes)} core block(s)`,
+    );
+    return trackSegments;
+  }
+
+  private async transcribeRangeWithRecovery(
+    track: UserTrackInput,
+    trackId: string,
+    trackOffsetSeconds: number,
+    totalBytes: number,
+    coreStartByte: number,
+    coreEndByte: number,
+    params: URLSearchParams,
+    progressDir: string,
+  ): Promise<Segment[]> {
+    const checkpointPath = path.join(
+      progressDir,
+      `${trackId}-${coreStartByte}-${coreEndByte}.json`,
+    );
+
+    if (fs.existsSync(checkpointPath)) {
+      try {
+        const saved = JSON.parse(fs.readFileSync(checkpointPath, 'utf8')) as ChunkCheckpoint;
+        if (
+          saved.version === 1 &&
+          saved.startByte === coreStartByte &&
+          saved.endByte === coreEndByte &&
+          Array.isArray(saved.segments)
+        ) {
+          console.log(
+            `[Transcription] Reusing checkpoint ${track.speakerName} bytes ${coreStartByte}-${coreEndByte}`,
+          );
+          return saved.segments;
+        }
+      } catch (err) {
+        console.warn(`[Transcription] Ignoring invalid checkpoint ${checkpointPath}:`, err);
+      }
+    }
+
+    const overlapBytes = Math.floor(
+      (this.overlapSeconds * PCM_BYTES_PER_SECOND) / PCM_FRAME_BYTES,
+    ) * PCM_FRAME_BYTES;
+    const requestStartByte = Math.max(0, coreStartByte - overlapBytes);
+    const requestEndByte = Math.min(totalBytes, coreEndByte + overlapBytes);
+    const requestBytes = requestEndByte - requestStartByte;
+    const coreStartSeconds = trackOffsetSeconds + coreStartByte / PCM_BYTES_PER_SECOND;
+    const coreEndSeconds = trackOffsetSeconds + coreEndByte / PCM_BYTES_PER_SECOND;
+    const requestOffsetSeconds = trackOffsetSeconds + requestStartByte / PCM_BYTES_PER_SECOND;
+
+    let result: any;
+    try {
+      const sizeMiB = (requestBytes / 1024 / 1024).toFixed(1);
+      console.log(
+        `[Transcription] Sending ${track.speakerName} block ` +
+        `[${(coreStartByte / PCM_BYTES_PER_SECOND).toFixed(1)}s-${(coreEndByte / PCM_BYTES_PER_SECOND).toFixed(1)}s] ` +
+        `(${sizeMiB}MiB including overlap)`,
+      );
+      result = await this.postToDeepgramStream(
+        fs.createReadStream(track.filePath, {
+          start: requestStartByte,
+          end: requestEndByte - 1,
+        }),
+        requestBytes,
+        params,
+        'audio/raw',
+      );
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      const blockDurationSeconds = (coreEndByte - coreStartByte) / PCM_BYTES_PER_SECOND;
+      const isGatewayTimeout =
+        error instanceof DeepgramRequestError && error.statusCode === 504;
+
+      if (isGatewayTimeout && blockDurationSeconds > this.minSplitSeconds) {
+        const midpointRaw = Math.floor((coreStartByte + coreEndByte) / 2);
+        const midpointByte = Math.floor(midpointRaw / PCM_FRAME_BYTES) * PCM_FRAME_BYTES;
+        if (midpointByte > coreStartByte && midpointByte < coreEndByte) {
+          console.warn(
+            `[Transcription] Deepgram returned 504 for ${track.speakerName} ` +
+            `(${blockDurationSeconds.toFixed(1)}s); splitting block into smaller ranges.`,
+          );
+          const left = await this.transcribeRangeWithRecovery(
+            track, trackId, trackOffsetSeconds, totalBytes,
+            coreStartByte, midpointByte, params, progressDir,
+          );
+          const right = await this.transcribeRangeWithRecovery(
+            track, trackId, trackOffsetSeconds, totalBytes,
+            midpointByte, coreEndByte, params, progressDir,
+          );
+          return [...left, ...right];
+        }
+      }
+
+      throw new Error(
+        `Transcription block failed for ${track.speakerName} ` +
+        `[${(coreStartByte / PCM_BYTES_PER_SECOND).toFixed(1)}s-${(coreEndByte / PCM_BYTES_PER_SECOND).toFixed(1)}s]: ${error.message}`,
+      );
+    }
+
+    const parsedSegments = this.extractSegments(
+      result,
+      track.speakerName,
+      requestOffsetSeconds,
+      false,
+    );
+    // Each block owns a non-overlapping core interval. Use utterance midpoints
+    // to assign a boundary-crossing utterance to exactly one block.
+    const coreSegments = parsedSegments.filter((segment) => {
+      const midpoint = (segment.start + segment.end) / 2;
+      return midpoint >= coreStartSeconds &&
+        (midpoint < coreEndSeconds ||
+          (coreEndByte === totalBytes && midpoint <= coreEndSeconds));
+    });
+
+    const checkpoint: ChunkCheckpoint = {
+      version: 1,
+      startByte: coreStartByte,
+      endByte: coreEndByte,
+      segments: coreSegments,
+    };
+    const temporaryPath = `${checkpointPath}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(temporaryPath, JSON.stringify(checkpoint), 'utf8');
+      fs.renameSync(temporaryPath, checkpointPath);
+    } finally {
+      if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+    }
+
+    console.log(
+      `[Transcription] Checkpoint saved for ${track.speakerName}: ` +
+      `${coreSegments.length} segment(s), bytes ${coreStartByte}-${coreEndByte}`,
+    );
+    return coreSegments;
   }
 
   /**
@@ -123,32 +396,6 @@ CampaignTermsService.applyToParams(params, campaignTerms);
     };
   }
 
-  private async transcribePcmTrack(track: UserTrackInput, offsetSeconds: number): Promise<Segment[]> {
-    const stats = fs.statSync(track.filePath);
-    const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
-    console.log(
-      `[Transcription] Sending ${path.basename(track.filePath)} (${track.speakerName}) ` +
-      `to Deepgram Nova-3 (${sizeMB}MB, offset=${offsetSeconds.toFixed(1)}s)`,
-    );
-
-    const params = new URLSearchParams({
-  model: 'nova-3',
-  language: 'multi',
-  encoding: 'linear16',
-  sample_rate: '48000',
-  channels: '2',
-  smart_format: 'true',
-  utterances: 'true',
-  punctuate: 'true',
-  paragraphs: 'true',
-});
-
-const campaignTerms = CampaignTermsService.load();
-CampaignTermsService.applyToParams(params, campaignTerms);    
-const result = await this.postToDeepgram(track.filePath, stats.size, params, 'audio/raw');
-    return this.extractSegments(result, track.speakerName, offsetSeconds, false);
-  }
-
   private async postToDeepgram(
     filePath: string,
     fileSize: number,
@@ -179,6 +426,43 @@ const result = await this.postToDeepgram(track.filePath, stats.size, params, 'au
     }
 
     return response.json();
+  }
+
+
+  private async postToDeepgramStream(
+    audioStream: NodeJS.ReadableStream,
+    fileSize: number,
+    params: URLSearchParams,
+    contentType: string,
+  ): Promise<any> {
+    try {
+      const response = await fetch(
+        `https://api.deepgram.com/v1/listen?${params.toString()}`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Token ${this.apiKey}`,
+            'Content-Type': contentType,
+            'Content-Length': fileSize.toString(),
+          },
+          body: audioStream as any,
+          // @ts-ignore - duplex is required for a streaming Node request body.
+          duplex: 'half',
+        },
+      );
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new DeepgramRequestError(response.status, errText);
+      }
+
+      return response.json();
+    } catch (err) {
+      try {
+        (audioStream as any).destroy?.();
+      } catch {}
+      throw err;
+    }
   }
 
   private extractSegments(
