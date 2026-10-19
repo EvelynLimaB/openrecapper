@@ -30,7 +30,7 @@ function successfulResponse(callNumber: number, bytes: number): Response {
     metadata: { duration: bytes / BYTES_PER_SECOND },
     results: {
       utterances: [{
-        start: 0.2,
+        start: 0.3,
         end: 0.5,
         transcript: `mock-segment-${callNumber}`,
         speaker: 0,
@@ -89,7 +89,7 @@ async function testBlockSplittingAndCache(): Promise<void> {
     assert(calls[2].bytes === 2.25 * BYTES_PER_SECOND, 'Final block is clipped to end of track');
     assert(first.segments.length === 3, 'One owned segment is retained from each block');
     assert(first.segments.every((segment) => segment.speaker === 'Kasane'), 'Known Discord speaker label is preserved');
-    assert(Math.abs(first.segments[0].start - 25.2) < 0.001, 'Track start offset is preserved in timestamps');
+    assert(Math.abs(first.segments[0].start - 25.3) < 0.001, 'Track start offset is preserved in timestamps');
     assert(first.segments[0].start < first.segments[1].start && first.segments[1].start < first.segments[2].start, 'Segments are chronologically ordered');
 
     const countBeforeResume = calls.length;
